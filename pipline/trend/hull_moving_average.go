@@ -7,131 +7,189 @@ import (
 	"time"
 )
 
-// describe: Hull Moving Average
+// Hull Moving Average (HMA)
 //
-// pipeConfigs: [{type: 'hMA', name: 'hMA', config: {period: <user supplied>, candleInterval: <user supplied>}}]
+// Formula:
 //
-// Available result: Current, Previous, IsReady, Timestamp and indicator-specific fields in types.go.
-// Entry Condition: Example - Previous <= 0 && Current > 0 (where meaningful); strategy decides entry.
-// Exit Condition: Example - Previous >= 0 && Current < 0 (where meaningful); strategy decides exit.
-// Original Formula: Hull Moving Average; see independent calculation in ingest.
-// Current is the latest value; Previous is the preceding ready value.
-// First ready value requires configured warm-up candles; see ingest.
-type HMAConfig struct {
-	Period         int
-	CandleInterval string
-}
+// HMA(n) = WMA(
+//     2 * WMA(Close, n/2) - WMA(Close, n),
+//     sqrt(n),
+// )
+//
+// WMA assigns larger weights to newer prices.
+//
+// Available Result:
+//   Current
+//   Previous
+//   IsReady
+//   Timestamp
+//
+// Entry and exit conditions are strategy-specific.
 
 type HMA struct {
-	id            string
-	cfg           HMAConfig
-	closes        []float64
-	highs         []float64
-	lows          []float64
+	id             string
+	Period         int
+	CandleInterval string
+
+	closes []float64
+
 	lastTimestamp time.Time
-	seeded        bool
-	hasResult     bool
-	value         float64
-	upper         float64
-	lower         float64
-	direction     int
-	sar           float64
-	extreme       float64
-	accel         float64
-	result        HMAResult
+
+	hasResult bool
+	value     float64
+
+	result HMAResult
 }
 
-func NewHMA(id string, cfg HMAConfig) (*HMA, error) {
+func NewHMA(id string, cfg map[string]any) (*HMA, error) {
 	if id == "" {
 		return nil, fmt.Errorf("indicator id is required")
 	}
-	if cfg.Period <= 0 {
+
+	period := 9
+	candleInterval := "1 minutes"
+
+	if value, ok := cfg["period"].(int); ok {
+		period = value
+	}
+
+	if value, ok := cfg["candleInterval"].(string); ok {
+		candleInterval = value
+	}
+
+	if period <= 0 {
 		return nil, fmt.Errorf("HMA: period must be positive")
 	}
-	return &HMA{id: id, cfg: cfg}, nil
+
+	return &HMA{
+		id:             id,
+		Period:         period,
+		CandleInterval: candleInterval,
+	}, nil
 }
-func (s *HMA) Update(candle core.MarketCandle) any { s.ingest(candle); return s.result }
-func (s *HMA) Result() any                         { return s.result }
+
+func (s *HMA) Update(candle core.MarketCandle) any {
+	s.ingest(candle)
+	return s.result
+}
+
+func (s *HMA) Result() any {
+	return s.result
+}
+
 func (s *HMA) ingest(candle core.MarketCandle) {
 	if candle == nil {
 		return
 	}
-	timestamp, high, low, close := candle.GetTime(), candle.GetHigh(), candle.GetLow(), candle.GetClose()
-	if timestamp.IsZero() || (!s.lastTimestamp.IsZero() && !timestamp.After(s.lastTimestamp)) || math.IsNaN(high) || math.IsInf(high, 0) || math.IsNaN(low) || math.IsInf(low, 0) || math.IsNaN(close) || math.IsInf(close, 0) || low <= 0 || high < low || close <= 0 {
+
+	timestamp := candle.GetTime()
+	high := candle.GetHigh()
+	low := candle.GetLow()
+	closePrice := candle.GetClose()
+
+	if timestamp.IsZero() ||
+		(!s.lastTimestamp.IsZero() &&
+			!timestamp.After(s.lastTimestamp)) ||
+		math.IsNaN(high) ||
+		math.IsInf(high, 0) ||
+		math.IsNaN(low) ||
+		math.IsInf(low, 0) ||
+		math.IsNaN(closePrice) ||
+		math.IsInf(closePrice, 0) ||
+		low <= 0 ||
+		high < low ||
+		closePrice <= 0 {
+
 		s.result.IsReady = false
 		return
 	}
+
 	s.lastTimestamp = timestamp
-	s.closes = append(s.closes, close)
-	s.highs = append(s.highs, high)
-	s.lows = append(s.lows, low)
-	// Preserve a bounded window for memory efficiency while retaining sufficient warmup history.
-	cfg := s.cfg
-	maxHistory := max(500, 4*cfg.Period+10)
-	if len(s.closes) > maxHistory {
-		s.closes = s.closes[1:]
-		s.highs = s.highs[1:]
-		s.lows = s.lows[1:]
-	}
-	period := cfg.Period
-	closes, highs, lows := s.closes, s.highs, s.lows
-	if len(closes) < period {
-		s.result.IsReady = false
-		s.result.Timestamp = timestamp
-		return
-	}
-	_ = cfg
-	_ = high
-	_ = low
-	_ = highs
-	_ = lows
-	var current float64
+	s.result.Timestamp = timestamp
+	s.result.IsReady = false
+
+	period := s.Period
+
 	half := period / 2
 	if half < 1 {
 		half = 1
 	}
+
 	root := int(math.Sqrt(float64(period)))
 	if root < 1 {
 		root = 1
 	}
-	if len(closes) < period+root-1 {
-		s.result.IsReady = false
+
+	// Only retain candles needed for HMA.
+	maxHistory := period + root - 1
+
+	s.closes = append(s.closes, closePrice)
+
+	if len(s.closes) > maxHistory {
+		s.closes = s.closes[1:]
+	}
+
+	if len(s.closes) < maxHistory {
 		return
 	}
-	var transformed []float64
-	for i := len(closes) - root; i < len(closes); i++ {
-		window := closes[i-period+1 : i+1]
-		transformed = append(transformed, 2*s.weighted(window[period-half:])-s.weighted(window))
+
+	// Calculate the transformed series:
+	//
+	// 2 * WMA(half period) - WMA(full period)
+
+	transformed := make([]float64, 0, root)
+
+	for i := len(s.closes) - root; i < len(s.closes); i++ {
+		window := s.closes[i-period+1 : i+1]
+
+		halfWMA := weightedAverage(
+			window[period-half:],
+		)
+
+		fullWMA := weightedAverage(window)
+
+		transformed = append(
+			transformed,
+			2*halfWMA-fullWMA,
+		)
 	}
-	current = s.weighted(transformed)
+
+	// Final Hull Moving Average.
+	current := weightedAverage(transformed)
+
 	if math.IsNaN(current) || math.IsInf(current, 0) {
-		s.result.IsReady = false
 		return
 	}
+
 	previous := current
 	if s.hasResult {
 		previous = s.value
 	}
-	s.result.IsReady = true
+
 	s.result.Current = current
 	s.result.Previous = previous
+	s.result.IsReady = true
 	s.result.Timestamp = timestamp
+
 	s.value = current
 	s.hasResult = true
 }
-func (s *HMA) avg(values []float64) float64 {
-	var sum float64
-	for _, v := range values {
-		sum += v
+
+// weightedAverage calculates a standard
+// linearly weighted moving average.
+//
+// Oldest value receives weight 1.
+// Newest value receives weight N.
+func weightedAverage(values []float64) float64 {
+	var numerator float64
+	var denominator float64
+
+	for i, value := range values {
+		weight := float64(i + 1)
+
+		numerator += value * weight
+		denominator += weight
 	}
-	return sum / float64(len(values))
-}
-func (s *HMA) weighted(values []float64) float64 {
-	var sum, den float64
-	for i, v := range values {
-		w := float64(i + 1)
-		sum += v * w
-		den += w
-	}
-	return sum / den
+
+	return numerator / denominator
 }

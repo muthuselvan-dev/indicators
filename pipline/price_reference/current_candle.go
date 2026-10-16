@@ -4,132 +4,74 @@ import (
 	"fmt"
 	"indicators/core"
 	"math"
+	"strings"
 	"time"
 )
 
-// describe: CurrentCandle
+// describe: Current Candle
 //
-// Exposes the latest accepted candle as a typed
-// OHLCV/OpenInterest snapshot.
+// QuantMan:
+// type: currentCandle
+// name: current
+// config: {candleInterval: "1 minutes"}
 //
-// pipeConfigs: [
+// Original Reference:
+// Current = latest accepted candle.
+// Previous = preceding accepted candle.
 //
-//	{
-//	  type: 'currentCandle',
-//	  name: 'currentCandle',
-//	  config: {
-//	    candleInterval: '1 minutes',
-//	  }
-//	}
-//
-// ],
-//
-// Available result:
-//
-//   - Current.Open
-//   - Current.High
-//   - Current.Low
-//   - Current.Close
-//   - Current.Volume
-//   - Current.OpenInterest
-//   - Current.Timestamp
-//   - Previous (previous accepted candle snapshot)
-//   - IsReady
-//   - Timestamp
-//
-// Entry Condition:
-//
-//	Current.Close Is Above Current.Open:
-//	  Current.Close > Current.Open
-//
-//	Current.Close Crosses Above Reference:
-//	  Compare consecutive ready snapshots.
-//
-// Exit Condition:
-//
-//	Current.Close Is Below Current.Open:
-//	  Current.Close < Current.Open
-//
-// Original Reference Rule:
-//
-//	Selected candle = current accepted candle.
-//
-//	No smoothing or mathematical formula.
+// No additional OHLCV snapshot structs.
+// Reuses core.MarketCandle.
 //
 // Warmup:
+// First valid candle is immediately ready.
 //
-//	First valid candle is immediately ready.
+// First ready result:
+// Previous = Current.
 //
-//	First ready result:
-//	  Previous = Current.
-//
-// Invalid candles:
-//
-//	Nil, invalid OHLCV/OI, duplicate timestamps,
-//	and out-of-order timestamps are ignored.
-//
-// Note:
-//
-//	"Current" represents the candle supplied to Update.
-//	The caller must ensure that candle is completed
-//	if completed-candle semantics are required.
-//
-//	QuantMan exact reference semantics and parity
-//	have not been verified.
 
 type CurrentCandleConfig struct {
 	CandleInterval string
 }
 
-// CurrentCandleSnapshot contains the accepted
-// candle's OHLCV/OpenInterest values.
-type CurrentCandleSnapshot struct {
-	Open         float64
-	High         float64
-	Low          float64
-	Close        float64
-	Volume       float64
-	OpenInterest float64
-	Timestamp    time.Time
-}
-
-// CurrentCandleResult contains current and
-// previous accepted candle snapshots.
-type CurrentCandleResult struct {
-	IsReady   bool
-	Current   CurrentCandleSnapshot
-	Previous  CurrentCandleSnapshot
-	Timestamp time.Time
-}
-
 type CurrentCandle struct {
-	id             string
-	candleInterval string
-
-	lastTimestamp time.Time
-
+	id        string
+	cfg       CurrentCandleConfig
+	lastTime  time.Time
 	hasResult bool
 	result    CurrentCandleResult
 }
 
-func NewCurrentCandle(
-	id string,
-	cfg CurrentCandleConfig,
-) (*CurrentCandle, error) {
+func NewCurrentCandle(id string, cfg map[string]any) (*CurrentCandle, error) {
 	if id == "" {
-		return nil, fmt.Errorf("CurrentCandle name cannot be empty")
+		return nil, fmt.Errorf("CurrentCandle: name cannot be empty")
+	}
+
+	interval := "1 minutes"
+
+	if value, exists := cfg["candleInterval"]; exists {
+		s, ok := value.(string)
+		if !ok {
+			return nil, fmt.Errorf("CurrentCandle: candleInterval must be a string")
+		}
+
+		s = strings.TrimSpace(s)
+		if s == "" {
+			return nil, fmt.Errorf("CurrentCandle: candleInterval cannot be empty")
+		}
+
+		interval = s
 	}
 
 	return &CurrentCandle{
-		id:             id,
-		candleInterval: cfg.CandleInterval,
+		id: id,
+		cfg: CurrentCandleConfig{
+			CandleInterval: interval,
+		},
 	}, nil
 }
 
-func (r *CurrentCandle) Update(
-	candle core.MarketCandle,
-) any {
-	r.ingest(candle)
+func (r *CurrentCandle) Update(c core.MarketCandle) any {
+	r.ingest(c)
 	return r.result
 }
 
@@ -137,30 +79,14 @@ func (r *CurrentCandle) Result() any {
 	return r.result
 }
 
-func (r *CurrentCandle) ingest(
-	candle core.MarketCandle,
-) {
-	if !validCurrentCandle(
-		candle,
-		r.lastTimestamp,
-	) {
+func (r *CurrentCandle) ingest(c core.MarketCandle) {
+	if !validCurrentCandle(c, r.lastTime) {
 		return
 	}
 
-	timestamp := candle.GetTime()
+	t := c.GetTime()
 
-	selected := CurrentCandleSnapshot{
-		Open:         candle.GetOpen(),
-		High:         candle.GetHigh(),
-		Low:          candle.GetLow(),
-		Close:        candle.GetClose(),
-		Volume:       candle.GetVolume(),
-		OpenInterest: candle.GetOpenInterest(),
-		Timestamp:    timestamp,
-	}
-
-	// First ready result uses Current as Previous.
-	previous := selected
+	previous := c
 
 	if r.hasResult {
 		previous = r.result.Current
@@ -168,85 +94,53 @@ func (r *CurrentCandle) ingest(
 
 	r.result = CurrentCandleResult{
 		IsReady:   true,
-		Current:   selected,
+		Current:   c,
 		Previous:  previous,
-		Timestamp: timestamp,
+		Timestamp: t,
 	}
 
-	r.lastTimestamp = timestamp
+	r.lastTime = t
 	r.hasResult = true
 }
 
-// Own validation helper for CurrentCandle.
-//
-// No dependency on other indicator files.
-func validCurrentCandle(
-	candle core.MarketCandle,
-	lastTimestamp time.Time,
-) bool {
-	if candle == nil {
+func validCurrentCandle(c core.MarketCandle, lastTime time.Time) bool {
+	if c == nil {
 		return false
 	}
 
-	timestamp := candle.GetTime()
+	t := c.GetTime()
 
-	if timestamp.IsZero() {
+	if t.IsZero() {
 		return false
 	}
 
-	// Reject duplicate and out-of-order timestamps.
-	if !lastTimestamp.IsZero() &&
-		!timestamp.After(lastTimestamp) {
+	if !lastTime.IsZero() && !t.After(lastTime) {
 		return false
 	}
 
-	open := candle.GetOpen()
-	high := candle.GetHigh()
-	low := candle.GetLow()
-	closePrice := candle.GetClose()
-	volume := candle.GetVolume()
-	openInterest := candle.GetOpenInterest()
+	o := c.GetOpen()
+	h := c.GetHigh()
+	l := c.GetLow()
+	cl := c.GetClose()
+	volume := c.GetVolume()
+	oi := c.GetOpenInterest()
 
-	// Validate price values.
-	for _, value := range []float64{
-		open,
-		high,
-		low,
-		closePrice,
-	} {
-		if math.IsNaN(value) ||
-			math.IsInf(value, 0) ||
-			value <= 0 {
+	for _, value := range []float64{o, h, l, cl} {
+		if math.IsNaN(value) || math.IsInf(value, 0) || value <= 0 {
 			return false
 		}
 	}
 
-	// Validate volume and open interest.
-	for _, value := range []float64{
-		volume,
-		openInterest,
-	} {
-		if math.IsNaN(value) ||
-			math.IsInf(value, 0) ||
-			value < 0 {
+	for _, value := range []float64{volume, oi} {
+		if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
 			return false
 		}
+
 	}
 
-	// Validate OHLC relationships.
-	if high < low {
-		return false
-	}
-
-	if high < math.Max(open, closePrice) {
-		return false
-	}
-
-	if low > math.Min(open, closePrice) {
+	if h < l || h < math.Max(o, cl) || l > math.Min(o, cl) {
 		return false
 	}
 
 	return true
 }
-
-var _ core.Indicator = (*CurrentCandle)(nil)

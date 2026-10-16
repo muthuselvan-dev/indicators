@@ -7,119 +7,135 @@ import (
 	"time"
 )
 
-// describe: Donchian Channel - rolling highest high and lowest low
+// Indicator Name: Donchian Channel
 //
-// pipeConfigs: [
+// QuantMan Pipe Config:
 //
-//	{
-//	  type: 'donChianChannel',
-//	  name: 'donChianChannel',
-//	  config: {
-//	    noOfCandles: 20,
-//	    candleInterval: '1 minutes',
-//	  }
-//	}
+// {
+//     Type: "donChianChannel",
+//     Name: "donChianChannel",
+//     Config: map[string]any{
+//         "length":         20,
+//         "lag":            false,
+//         "candleInterval": "1 minutes",
+//     },
+// }
 //
-// ],
+// Formula:
 //
-// Available result:
+//   Upper  = HighestHigh(Length)
+//   Lower  = LowestLow(Length)
+//   Middle = (Upper + Lower) / 2
 //
-//   - Upper
-//   - Lower
-//   - Middle
-//   - Current (Middle)
-//   - Previous
-//   - IsReady
-//   - Timestamp
+// Lag:
 //
-// Entry Condition:
+//   lag = false : the channel INCLUDES the current candle.
+//                 Close can never be above the Upper band (Close <= High
+//                 <= Upper), so "Close Is Above Upper" never triggers.
+//                 Verified: QuantMan returns "No entry signals" for
+//                 Close Is Above Upper with lag = false.
 //
-//	Close Is Above Previous Upper Band:
-//	  Close > PreviousUpper
+//   lag = true  : the channel is shifted by one candle: the Upper/Lower/
+//                 Middle reported on candle t are the channel of candle
+//                 t-1 (window = the Length candles before the current one).
+//                 This makes breakouts possible.
+//                 NOTE: this lag semantics is an assumption, not yet
+//                 verified against a QuantMan lag = true run.
 //
-//	Close Crosses Above Previous Upper Band:
-//	  PreviousClose <= PreviousUpper && Close > PreviousUpper
+// Entry Condition (QuantMan):
+//   Current Close Is Above Don Chian Channel Upper:  Close > Upper
 //
-// Exit Condition:
+// Exit Condition (QuantMan):
+//   Current Close Is Below Don Chian Channel Lower:  Close < Lower
 //
-//	Close Is Below Previous Lower Band:
-//	  Close < PreviousLower
+// Result:
 //
-//	Close Crosses Below Previous Lower Band:
-//	  PreviousClose >= PreviousLower && Close < PreviousLower
+//   Upper
+//   Lower
+//   Middle
 //
-// Original Formula:
-//
-//	Upper = HighestHigh(Last N Candles)
-//
-//	Lower = LowestLow(Last N Candles)
-//
-//	Middle = (Upper + Lower) / 2
-//
-// BaseResult:
-//
-//	Current:
-//	  Latest Middle Channel value.
-//
-//	Previous:
-//	  Previous ready Middle Channel value.
-//
-//	IsReady:
-//	  True after N valid candles.
-//
-//	Timestamp:
-//	  Latest processed valid candle timestamp.
+//   BaseResult:
+//     Current   = Middle
+//     Previous  = Previous ready Middle
+//     IsReady
+//     Timestamp
 //
 // Warmup:
-//
-//	First ready result requires N valid candles.
-//
-// Important:
-//
-//	The current candle is included in the channel calculation.
-//	For breakout strategies, compare the current price with
-//	the previous completed channel to avoid look-ahead bias.
-//
-// Reference:
-// https://www.investopedia.com/terms/d/donchianchannels.asp
-//
-// Note:
-// QuantMan exact calculation parity has not been verified.
+//   lag = false : first ready result requires Length valid candles.
+//   lag = true  : first ready result requires Length + 1 valid candles.
 
 type DonchianChannelConfig struct {
-	NoOfCandles    int
+	Length         int
+	Lag            bool
 	CandleInterval string
 }
 
 type DonchianChannel struct {
-	id             string
-	period         int
-	candleInterval string
+	id  string
+	cfg DonchianChannelConfig
 
 	highs []float64
 	lows  []float64
 
-	lastTimestamp time.Time
+	lastTime time.Time
 
+	// Channel of the previous candle (used when Lag = true).
+	hasPrevChannel bool
+	prevUpper      float64
+	prevLower      float64
+	prevMiddle     float64
+
+	// Previous ready reported Middle.
 	hasResult bool
 	lastValue float64
 
 	result DonchianChannelResult
 }
 
-func NewDonchianChannel(id string, cfg DonchianChannelConfig) (*DonchianChannel, error) {
+func NewDonchianChannel(id string, cfg map[string]any) (*DonchianChannel, error) {
 	if id == "" {
-		return nil, fmt.Errorf("Donchian Channel name cannot be empty")
+		return nil, fmt.Errorf("donChianChannel: indicator id is required")
 	}
 
-	if cfg.NoOfCandles <= 0 {
-		return nil, fmt.Errorf("Donchian Channel period must be positive")
+	config := DonchianChannelConfig{
+		Length:         20,
+		Lag:            false,
+		CandleInterval: "1 minutes",
+	}
+
+	if value, exists := cfg["length"]; exists {
+		length, ok := value.(int)
+		if !ok {
+			return nil, fmt.Errorf("donChianChannel: length must be an integer")
+		}
+		config.Length = length
+	}
+
+	if value, exists := cfg["lag"]; exists {
+		lag, ok := value.(bool)
+		if !ok {
+			return nil, fmt.Errorf("donChianChannel: lag must be boolean")
+		}
+		config.Lag = lag
+	}
+
+	if value, exists := cfg["candleInterval"]; exists {
+		interval, ok := value.(string)
+		if !ok || interval == "" {
+			return nil, fmt.Errorf("donChianChannel: invalid candleInterval")
+		}
+		config.CandleInterval = interval
+	}
+
+	if config.Length <= 0 {
+		return nil, fmt.Errorf("donChianChannel: length must be positive")
 	}
 
 	return &DonchianChannel{
-		id:             id,
-		period:         cfg.NoOfCandles,
-		candleInterval: cfg.CandleInterval,
+		id:    id,
+		cfg:   config,
+		highs: make([]float64, 0, config.Length),
+		lows:  make([]float64, 0, config.Length),
 	}, nil
 }
 
@@ -132,8 +148,18 @@ func (d *DonchianChannel) Result() any {
 	return d.result
 }
 
+func (d *DonchianChannel) notReady(timestamp time.Time) {
+	d.result = DonchianChannelResult{
+		BaseResult: BaseResult{
+			IsReady:   false,
+			Timestamp: timestamp,
+		},
+	}
+}
+
 func (d *DonchianChannel) ingest(candle core.MarketCandle) {
-	if !validDonchianChannelCandle(candle, d.lastTimestamp) {
+	if !validDonchianChannelCandle(candle, d.lastTime) {
+		d.result.IsReady = false
 		return
 	}
 
@@ -141,29 +167,24 @@ func (d *DonchianChannel) ingest(candle core.MarketCandle) {
 	high := candle.GetHigh()
 	low := candle.GetLow()
 
-	d.lastTimestamp = timestamp
+	d.lastTime = timestamp
 
-	// Maintain rolling High and Low values.
+	// Step 1: Maintain rolling High and Low.
 	d.highs = append(d.highs, high)
 	d.lows = append(d.lows, low)
 
-	if len(d.highs) > d.period {
+	if len(d.highs) > d.cfg.Length {
 		d.highs = d.highs[1:]
 		d.lows = d.lows[1:]
 	}
 
-	// Wait until N valid candles.
-	if len(d.highs) < d.period {
-		d.result = DonchianChannelResult{
-			BaseResult: BaseResult{
-				IsReady:   false,
-				Timestamp: timestamp,
-			},
-		}
+	// Step 2: Wait for N valid candles.
+	if len(d.highs) < d.cfg.Length {
+		d.notReady(timestamp)
 		return
 	}
 
-	// Find highest high and lowest low.
+	// Step 3: Channel of the window ending at the current candle.
 	upper := d.highs[0]
 	lower := d.lows[0]
 
@@ -172,36 +193,48 @@ func (d *DonchianChannel) ingest(candle core.MarketCandle) {
 		lower = math.Min(lower, d.lows[i])
 	}
 
-	// Calculate middle channel.
 	middle := (upper + lower) / 2
 
-	// Previous equals Current on first ready candle.
-	previous := middle
+	// Step 4: Lag. Report the previous candle's channel.
+	outUpper, outLower, outMiddle := upper, lower, middle
+
+	if d.cfg.Lag {
+		if !d.hasPrevChannel {
+			d.prevUpper, d.prevLower, d.prevMiddle = upper, lower, middle
+			d.hasPrevChannel = true
+			d.notReady(timestamp)
+			return
+		}
+
+		outUpper, outLower, outMiddle = d.prevUpper, d.prevLower, d.prevMiddle
+		d.prevUpper, d.prevLower, d.prevMiddle = upper, lower, middle
+	}
+
+	// Step 5: Previous ready Middle.
+	previous := outMiddle
 
 	if d.hasResult {
 		previous = d.lastValue
 	}
 
+	// Step 6: Update result.
 	d.result = DonchianChannelResult{
 		BaseResult: BaseResult{
 			IsReady:   true,
-			Current:   middle,
+			Current:   outMiddle,
 			Previous:  previous,
 			Timestamp: timestamp,
 		},
-		Upper:  upper,
-		Lower:  lower,
-		Middle: middle,
+		Upper:  outUpper,
+		Lower:  outLower,
+		Middle: outMiddle,
 	}
 
-	d.lastValue = middle
+	d.lastValue = outMiddle
 	d.hasResult = true
 }
 
-// Own validation helper for Donchian Channel.
-// No dependency on other indicator helper functions.
 func validDonchianChannelCandle(candle core.MarketCandle, lastTimestamp time.Time) bool {
-
 	if candle == nil {
 		return false
 	}
@@ -213,8 +246,7 @@ func validDonchianChannelCandle(candle core.MarketCandle, lastTimestamp time.Tim
 	}
 
 	// Reject duplicate or out-of-order candles.
-	if !lastTimestamp.IsZero() &&
-		!timestamp.After(lastTimestamp) {
+	if !lastTimestamp.IsZero() && !timestamp.After(lastTimestamp) {
 		return false
 	}
 
@@ -223,15 +255,8 @@ func validDonchianChannelCandle(candle core.MarketCandle, lastTimestamp time.Tim
 	low := candle.GetLow()
 	closePrice := candle.GetClose()
 
-	for _, value := range []float64{
-		open,
-		high,
-		low,
-		closePrice,
-	} {
-		if math.IsNaN(value) ||
-			math.IsInf(value, 0) ||
-			value <= 0 {
+	for _, value := range []float64{open, high, low, closePrice} {
+		if math.IsNaN(value) || math.IsInf(value, 0) || value <= 0 {
 			return false
 		}
 	}

@@ -1,47 +1,37 @@
 package main
 
 import (
+	"fmt"
 	"log"
 
-	"indicators/condition"
-	"indicators/core/datasource"
-	"indicators/pipline"
-	"indicators/strategy"
+	"indicators/aggregate"
+	"indicators/datasource"
 )
 
-func main() {
-	// Indicator Pipeline Configuration:
-	// Add all your indicators to this list (RSI, CCI, and any future indicators):
-	pipeConfigs := []pipline.Rule{
-		{
-			Type: "relativeStrengthIndex",
-			Name: "rsi",
-			Config: map[string]any{
-				"period":         14,
-				"candleInterval": "1 minutes",
-			},
-		},
+const printDate = "2025-08-28" // "" = all days
 
-		{
-			Type: "commodityChannelIndex",
-			Name: "commodityChannelIndex",
-			Config: map[string]any{
-				"period":         20,
-				"candleInterval": "1 minutes",
-			},
-		},
-		{
-			Type: "awesomeOscillator",
-			Name: "awesomeOscillator",
-			Config: map[string]any{
-				"candleInterval": "1 minutes",
-				"fastPeriod":     5,
-				"slowPeriod":     34,
-			},
-		},
+func main() {
+
+	// Standard Candle
+	// aggregateConfig := map[string]any{
+	// 	"type":           "candle",
+	// 	"candleInterval": "1 h",
+	// }
+
+	// Heikin Ashi
+	// aggregateConfig := map[string]any{
+	// 	"type":           "heikinashi",
+	// 	"candleInterval": "1 h",
+	// }
+
+	// Volume Candle
+	aggregateConfig := map[string]any{
+		"type":           "volumeCandle",
+		"candleInterval": "1 h",
+		"volumeInterval": "5 min",
 	}
 
-	pl, err := pipline.NewPipeline(pipeConfigs)
+	engine, err := aggregate.NewAggregator(aggregateConfig)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -51,30 +41,46 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// Strategy Configuration:
-	// Available Operators:
-	// - condition.EqualTo
-	// - condition.IsAbove
-	// - condition.IsBelow
-	// - condition.CrossesAbove
-	// - condition.CrossesBelow
-	// - condition.EqualOrAbove
-	// - condition.EqualOrBelow
-	cfg := strategy.Config{
-		StartDate: "01-08-2025",
-		EndDate:   "28-08-2025",
-		Indicator: "awesomeOscillator", // Select which indicator from pipeConfigs to run strategy on
+	fmt.Println("Date Time          Open         High         Low          Close        Volume")
+	fmt.Println("--------------------------------------------------------------------------------")
 
-		Entry: condition.Rule{
-			Operator: condition.CrossesAbove,
-			Value:    0,
-		},
-		Exit: condition.Rule{
-			Operator: condition.CrossesBelow,
-			Value:    0,
-		},
+	count := 0
+
+	for _, candle := range candles {
+		t := candle.GetTime()
+
+		// NSE market hours: 09:15 - 15:29
+		if t.Hour() < 9 || (t.Hour() == 9 && t.Minute() < 15) {
+			continue
+		}
+
+		if t.Hour() > 15 || (t.Hour() == 15 && t.Minute() >= 30) {
+			continue
+		}
+
+		// Aggregate candle using selected chart type
+		result, ready := engine.Aggregate(candle)
+		if !ready || result == nil {
+			continue
+		}
+
+		if printDate != "" &&
+			result.GetTime().Format("2006-01-02") != printDate {
+			continue
+		}
+
+		fmt.Printf(
+			"%s  %12.2f %12.2f %12.2f %12.2f %12.0f\n",
+			result.GetTime().Format("02-01-2006 15:04"),
+			result.GetOpen(),
+			result.GetHigh(),
+			result.GetLow(),
+			result.GetClose(),
+			result.GetVolume(),
+		)
+
+		count++
 	}
 
-	// Execute Backtest Strategy
-	strategy.Run(candles, pl, cfg)
+	fmt.Printf("\nTotal chart candles: %d\n", count)
 }

@@ -7,100 +7,44 @@ import (
 	"time"
 )
 
-// describe: PreviousCandle
+// describe: Previous Candle
 //
-// Exposes the immediately preceding completed candle
-// as a typed OHLCV/OI snapshot.
+// QuantMan pipeConfigs:
+// {
+//   type: "previousCandle",
+//   name: "previous",
+//   config: {
+//     candleInterval: "1 minutes"
+//   }
+// }
 //
-// pipeConfigs: [
+// Current  = Immediately previous candle.
+// Previous = Reference from previous ready update.
 //
-//	{
-//	  type: 'previousCandle',
-//	  name: 'previousCandle',
-//	  config: {
-//	    candleInterval: '1 minutes',
-//	  }
-//	}
-//
-// ],
-//
-// Available result:
-//
-//   - Current: Previous completed candle snapshot
-//   - Previous: Snapshot returned by preceding ready update
-//   - IsReady
-//   - Timestamp
-//
-// Entry Condition:
-//
-//	Current.Close Is Above Current.Open:
-//	  Current.Close > Current.Open
-//
-//	Current.Close Crosses Above Reference:
-//	  Compare consecutive ready snapshots.
-//
-// Exit Condition:
-//
-//	Current.Close Is Below Current.Open:
-//	  Current.Close < Current.Open
-//
-// Original Reference Rule:
-//
-//	Selected candle = one valid candle before current.
-//
-//	No smoothing or mathematical indicator formula.
-//
-// Warmup:
-//
-//	Requires two valid candles.
-//
-//	First ready result:
-//	  Previous = Current.
-//
-// Important:
-//
-//	Invalid, duplicate and out-of-order candles
-//	do not advance the reference.
-//
-//	QuantMan exact reference semantics are not verified.
-
-type PreviousCandleConfig struct {
-	CandleInterval string
-}
-
-// PreviousCandleSnapshot stores one completed candle.
-type PreviousCandleSnapshot struct {
-	Open         float64
-	High         float64
-	Low          float64
-	Close        float64
-	Volume       float64
-	OpenInterest float64
-	Timestamp    time.Time
-}
+// Warmup: 2 valid candles.
+// QuantMan exact parity not yet verified.
 
 type PreviousCandle struct {
 	id             string
 	candleInterval string
 
+	lastCandle    core.MarketCandle
 	lastTimestamp time.Time
+	hasResult     bool
 
-	lastCandle PreviousCandleSnapshot
-	hasCandle  bool
-
-	result    PreviousCandleResult
-	hasResult bool
+	result PreviousCandleResult
 }
 
-func NewPreviousCandle(id string, cfg PreviousCandleConfig) (*PreviousCandle, error) {
-
+func NewPreviousCandle(id string, cfg map[string]any) (*PreviousCandle, error) {
 	if id == "" {
 		return nil, fmt.Errorf("PreviousCandle name cannot be empty")
 	}
 
+	interval, _ := cfg["candleInterval"].(string)
+
 	return &PreviousCandle{
 		id:             id,
-		candleInterval: cfg.CandleInterval,
+		candleInterval: interval,
 	}, nil
 }
 
@@ -114,43 +58,43 @@ func (r *PreviousCandle) Result() any {
 }
 
 func (r *PreviousCandle) ingest(candle core.MarketCandle) {
-
-	if !validPreviousCandle(candle, r.lastTimestamp) {
+	if candle == nil {
 		return
 	}
 
-	timestamp := candle.GetTime()
+	t := candle.GetTime()
+	o := candle.GetOpen()
+	h := candle.GetHigh()
+	l := candle.GetLow()
+	c := candle.GetClose()
+	v := candle.GetVolume()
+	oi := candle.GetOpenInterest()
 
-	currentSnapshot := PreviousCandleSnapshot{
-		Open:         candle.GetOpen(),
-		High:         candle.GetHigh(),
-		Low:          candle.GetLow(),
-		Close:        candle.GetClose(),
-		Volume:       candle.GetVolume(),
-		OpenInterest: candle.GetOpenInterest(),
-		Timestamp:    timestamp,
+	if t.IsZero() ||
+		(!r.lastTimestamp.IsZero() && !t.After(r.lastTimestamp)) ||
+		!validPreviousCandleOHLC(o, h, l, c) ||
+		!validPreviousCandleValue(v) ||
+		!validPreviousCandleValue(oi) {
+		return
 	}
 
-	r.lastTimestamp = timestamp
+	r.lastTimestamp = t
 
-	// First candle is only stored for reference.
-	if !r.hasCandle {
-		r.lastCandle = currentSnapshot
-		r.hasCandle = true
+	// First candle: warmup.
+	if r.lastCandle == nil {
+		r.lastCandle = candle
 
 		r.result = PreviousCandleResult{
 			IsReady:   false,
-			Timestamp: timestamp,
+			Timestamp: t,
 		}
 		return
 	}
 
-	// Select the preceding completed candle.
+	// Immediately preceding candle.
 	selected := r.lastCandle
 
-	// First ready result uses selected as Previous.
 	previous := selected
-
 	if r.hasResult {
 		previous = r.result.Current
 	}
@@ -159,47 +103,15 @@ func (r *PreviousCandle) ingest(candle core.MarketCandle) {
 		IsReady:   true,
 		Current:   selected,
 		Previous:  previous,
-		Timestamp: timestamp,
+		Timestamp: t,
 	}
 
+	r.lastCandle = candle
 	r.hasResult = true
-
-	// Save latest candle for the next update.
-	r.lastCandle = currentSnapshot
 }
 
-// Own validation helper for PreviousCandle.
-// No dependency on other indicator files.
-func validPreviousCandle(candle core.MarketCandle, lastTimestamp time.Time) bool {
-	if candle == nil {
-		return false
-	}
-
-	timestamp := candle.GetTime()
-
-	if timestamp.IsZero() {
-		return false
-	}
-
-	// Reject duplicate or out-of-order candles.
-	if !lastTimestamp.IsZero() &&
-		!timestamp.After(lastTimestamp) {
-		return false
-	}
-
-	open := candle.GetOpen()
-	high := candle.GetHigh()
-	low := candle.GetLow()
-	closePrice := candle.GetClose()
-	volume := candle.GetVolume()
-	openInterest := candle.GetOpenInterest()
-
-	for _, value := range []float64{
-		open,
-		high,
-		low,
-		closePrice,
-	} {
+func validPreviousCandleOHLC(o, h, l, c float64) bool {
+	for _, value := range []float64{o, h, l, c} {
 		if math.IsNaN(value) ||
 			math.IsInf(value, 0) ||
 			value <= 0 {
@@ -207,30 +119,12 @@ func validPreviousCandle(candle core.MarketCandle, lastTimestamp time.Time) bool
 		}
 	}
 
-	for _, value := range []float64{
-		volume,
-		openInterest,
-	} {
-		if math.IsNaN(value) ||
-			math.IsInf(value, 0) ||
-			value < 0 {
-			return false
-		}
-	}
-
-	if high < low {
-		return false
-	}
-
-	if high < math.Max(open, closePrice) {
-		return false
-	}
-
-	if low > math.Min(open, closePrice) {
-		return false
-	}
-
-	return true
+	return h >= math.Max(o, c) &&
+		l <= math.Min(o, c)
 }
 
-var _ core.Indicator = (*PreviousCandle)(nil)
+func validPreviousCandleValue(value float64) bool {
+	return !math.IsNaN(value) &&
+		!math.IsInf(value, 0) &&
+		value >= 0
+}

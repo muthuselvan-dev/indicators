@@ -7,212 +7,237 @@ import (
 	"time"
 )
 
-// describe: Moving Average For ATR
+// Indicator: Moving Average For ATR
 //
-// pipeConfigs: [
-//   {type: 'movingAverageForATR', name: 'movingAverageForATR', config: {period: 14, candleInterval: '1 minutes'}},
-// ]
+// QuantMan Original Config:
+//   type: "movingAverageForATR"
+//   name: "movingAverageForATR"
+//   noOfCandles: 14
+//   candleInterval: "1 minutes"
 //
-// Available result:
-//   - Current, Previous, IsReady, Timestamp
+// Go Pipe Config:
+//   Type: "movingAverageForATR"
+//   Name: "movingAverageForATR"
+//   Config: map[string]any{
+//       "period":         14,
+//       "candleInterval": "1 minutes",
+//   }
 //
-// Entry Condition:
-//   Is Above threshold: Current > threshold
-//   Crosses Above threshold: Previous <= threshold && Current > threshold
+// Formula:
+//   TR = Max(
+//       High - Low,
+//       Abs(High - PreviousClose),
+//       Abs(Low - PreviousClose),
+//   )
 //
-// Exit Condition:
-//   Is Below threshold: Current < threshold
-//   Crosses Below threshold: Previous >= threshold && Current < threshold
+//   MovingAverageForATR = SMA(TR, Period)
 //
-// Original Formula / Explicit Interpretation:
-//   True Range=max(H-L,abs(H-prevClose),abs(L-prevClose)); Current=SMA(TR,N).
+// First candle:
+//   TR = High - Low
 //
-// Source: Standard OHLC arithmetic; QuantMan-specific semantics not verified.
-// Example config values are NOT claimed QuantMan defaults.
-// Warm-up: depends on period and prior-session availability.
+// Warmup:
+//   Period valid candles.
+//
+// Entry:
+//   Current > Threshold
+//   Previous <= Threshold && Current > Threshold
+//
+// Exit:
+//   Current < Threshold
+//   Previous >= Threshold && Current < Threshold
+//
+// Result:
+//   Current, Previous, IsReady, Timestamp
+//
+// Note:
+//   This implements SMA of True Range.
+//   QuantMan-specific smoothing and parity are unverified.
 
 type MovingAverageForAverageTrueRangeConfig struct {
 	Period         int
-	Multiplier     float64
-	MaxBodyRatio   float64
 	CandleInterval string
 }
+
 type MovingAverageForAverageTrueRange struct {
-	id               string
-	cfg              MovingAverageForAverageTrueRangeConfig
-	candles          []movingaverageforaveragetruerangeSnapshotInternal
-	lastTime         time.Time
-	hasResult        bool
-	result           ScalarResult
-	sessionDay       string
-	sessionOpen      float64
-	sessionHigh      float64
-	sessionLow       float64
-	previousDayClose float64
-	hasPreviousDay   bool
-}
-type MovingAverageForAverageTrueRangeSnapshot struct {
-	Open, High, Low, Close float64
-	Timestamp              time.Time
-}
-type movingaverageforaveragetruerangeSnapshotInternal struct {
-	open, high, low, close float64
-	timestamp              time.Time
+	id  string
+	cfg MovingAverageForAverageTrueRangeConfig
+
+	trueRanges []float64
+	trSum      float64
+
+	previousClose float64
+	hasPrevious   bool
+
+	lastTime time.Time
+
+	hasResult bool
+	lastValue float64
+
+	result ScalarResult
 }
 
-func NewMovingAverageForAverageTrueRange(id string, cfg MovingAverageForAverageTrueRangeConfig) (*MovingAverageForAverageTrueRange, error) {
-	if id == "" || cfg.Period <= 0 {
-		return nil, fmt.Errorf("Moving Average For ATR: name and positive period required")
+func NewMovingAverageForAverageTrueRange(id string, cfg map[string]any) (*MovingAverageForAverageTrueRange, error) {
+	if id == "" {
+		return nil, fmt.Errorf("movingAverageForATR: indicator id is required")
 	}
-	if cfg.Multiplier < 0 || cfg.MaxBodyRatio < 0 {
-		return nil, fmt.Errorf("Moving Average For ATR: invalid multiplier/ratio")
+
+	config := MovingAverageForAverageTrueRangeConfig{
+		Period:         14,
+		CandleInterval: "1 minutes",
 	}
-	return &MovingAverageForAverageTrueRange{id: id, cfg: cfg}, nil
+
+	if value, exists := cfg["period"]; exists {
+		period, ok := value.(int)
+		if !ok {
+			return nil, fmt.Errorf("movingAverageForATR: period must be an integer")
+		}
+		config.Period = period
+	}
+
+	if value, exists := cfg["candleInterval"]; exists {
+		interval, ok := value.(string)
+		if !ok || interval == "" {
+			return nil, fmt.Errorf("movingAverageForATR: invalid candleInterval")
+		}
+		config.CandleInterval = interval
+	}
+
+	if config.Period <= 0 {
+		return nil, fmt.Errorf("movingAverageForATR: period must be positive")
+	}
+
+	return &MovingAverageForAverageTrueRange{
+		id:         id,
+		cfg:        config,
+		trueRanges: make([]float64, 0, config.Period),
+	}, nil
 }
-func (r *MovingAverageForAverageTrueRange) Update(c core.MarketCandle) any {
-	r.ingest(c)
+
+func (r *MovingAverageForAverageTrueRange) Update(candle core.MarketCandle) any {
+	r.ingest(candle)
 	return r.result
 }
-func (r *MovingAverageForAverageTrueRange) Result() any { return r.result }
-func (r *MovingAverageForAverageTrueRange) ingest(c core.MarketCandle) {
-	if c == nil {
+
+func (r *MovingAverageForAverageTrueRange) Result() any {
+	return r.result
+}
+
+func (r *MovingAverageForAverageTrueRange) ingest(candle core.MarketCandle) {
+	if !validMovingAverageForATRCandle(candle, r.lastTime) {
+		r.result.IsReady = false
 		return
 	}
-	t := c.GetTime()
-	o, h, l, cl := c.GetOpen(), c.GetHigh(), c.GetLow(), c.GetClose()
-	if t.IsZero() || (!r.lastTime.IsZero() && !t.After(r.lastTime)) || o <= 0 || h < l || h < math.Max(o, cl) || l > math.Min(o, cl) || math.IsNaN(cl) || math.IsInf(cl, 0) {
-		r.result = ScalarResult{Timestamp: t}
+
+	timestamp := candle.GetTime()
+	high := candle.GetHigh()
+	low := candle.GetLow()
+	closePrice := candle.GetClose()
+
+	// Step 1: Calculate True Range.
+	trueRange := high - low
+
+	if r.hasPrevious {
+		trueRange = math.Max(
+			high-low,
+			math.Max(
+				math.Abs(high-r.previousClose),
+				math.Abs(low-r.previousClose),
+			),
+		)
+	}
+
+	// Step 2: Maintain rolling True Range window.
+	r.trueRanges = append(r.trueRanges, trueRange)
+	r.trSum += trueRange
+
+	if len(r.trueRanges) > r.cfg.Period {
+		r.trSum -= r.trueRanges[0]
+		r.trueRanges = r.trueRanges[1:]
+	}
+
+	// Step 3: Update candle state.
+	r.previousClose = closePrice
+	r.hasPrevious = true
+	r.lastTime = timestamp
+
+	// Step 4: Warmup.
+	if len(r.trueRanges) < r.cfg.Period {
+		r.result = ScalarResult{
+			IsReady:   false,
+			Timestamp: timestamp,
+		}
 		return
 	}
-	r.lastTime = t
-	day := t.Format("2006-01-02")
-	newDay := day != r.sessionDay
-	if newDay {
-		if r.sessionDay != "" {
-			r.previousDayClose = r.candles[len(r.candles)-1].close
-			r.hasPreviousDay = true
+
+	// Step 5: SMA of True Range.
+	current := r.trSum / float64(r.cfg.Period)
+
+	if math.IsNaN(current) || math.IsInf(current, 0) {
+		r.result = ScalarResult{
+			IsReady:   false,
+			Timestamp: timestamp,
 		}
-		r.sessionDay = day
-		r.sessionOpen = o
-		r.sessionHigh = h
-		r.sessionLow = l
-	} else {
-		if h > r.sessionHigh {
-			r.sessionHigh = h
-		}
-		if l < r.sessionLow {
-			r.sessionLow = l
-		}
-	}
-	s := movingaverageforaveragetruerangeSnapshotInternal{open: o, high: h, low: l, close: cl, timestamp: t}
-	previous := movingaverageforaveragetruerangeSnapshotInternal{}
-	hasPrevious := len(r.candles) > 0
-	if hasPrevious {
-		previous = r.candles[len(r.candles)-1]
-	}
-	r.candles = append(r.candles, s)
-	n := r.cfg.Period
-	if len(r.candles) > n+2 {
-		r.candles = r.candles[len(r.candles)-(n+2):]
-	}
-	current := 0.0
-	ready := false
-	switch "atrma" {
-	case "previous":
-		if hasPrevious {
-			current = previous.close
-			ready = true
-		}
-	case "indecision", "indecision_value":
-		if hasPrevious && previous.high > previous.low {
-			ratio := math.Abs(previous.close-previous.open) / (previous.high - previous.low)
-			if "atrma" == "indecision_value" {
-				current = ratio
-			} else if ratio <= r.cfg.MaxBodyRatio {
-				current = 1
-			}
-			ready = true
-		}
-	case "at":
-		if len(r.candles) > n {
-			current = r.candles[len(r.candles)-1-n].close
-			ready = true
-		}
-	case "lastn":
-		if len(r.candles) >= n {
-			for _, x := range r.candles[len(r.candles)-n:] {
-				current += x.close
-			}
-			current /= float64(n)
-			ready = true
-		}
-	case "today":
-		current = cl
-		ready = true
-	case "prevday":
-		if r.hasPreviousDay {
-			current = r.previousDayClose
-			ready = true
-		}
-	case "gap":
-		if r.hasPreviousDay {
-			current = r.sessionOpen - r.previousDayClose
-			ready = true
-		}
-	case "orb":
-		if len(r.candles) >= n {
-			high := r.candles[len(r.candles)-n].high
-			for _, x := range r.candles[len(r.candles)-n:] {
-				if x.high > high {
-					high = x.high
-				}
-			}
-			current = cl - high
-			ready = true
-		}
-	case "range":
-		if len(r.candles) > n {
-			high := r.candles[len(r.candles)-1-n].high
-			for _, x := range r.candles[len(r.candles)-1-n : len(r.candles)-1] {
-				if x.high > high {
-					high = x.high
-				}
-			}
-			current = cl - high
-			ready = true
-		}
-	case "mrc":
-		if len(r.candles) >= n {
-			for _, x := range r.candles[len(r.candles)-n:] {
-				current += x.close
-			}
-			current /= float64(n)
-			ready = true
-		}
-	case "atrma":
-		if len(r.candles) >= n+1 {
-			for i := len(r.candles) - n; i < len(r.candles); i++ {
-				x, p := r.candles[i], r.candles[i-1]
-				tr := math.Max(x.high-x.low, math.Max(math.Abs(x.high-p.close), math.Abs(x.low-p.close)))
-				current += tr
-			}
-			current /= float64(n)
-			ready = true
-		}
-	case "rsima":
-		// RSI-of-RSI smoothing requires a separate RSI lookback; fail closed until configured.
-		ready = false
-	}
-	if !ready {
-		r.result = ScalarResult{Timestamp: t}
 		return
 	}
-	prev := current
+
+	// Step 6: Previous ready value.
+	previous := current
+
 	if r.hasResult {
-		prev = r.result.Current
+		previous = r.lastValue
 	}
-	r.result = ScalarResult{IsReady: true, Current: current, Previous: prev, Timestamp: t}
+
+	// Step 7: Store result.
+	r.result = ScalarResult{
+		IsReady:   true,
+		Current:   current,
+		Previous:  previous,
+		Timestamp: timestamp,
+	}
+
+	r.lastValue = current
 	r.hasResult = true
 }
 
-var _ core.Indicator = (*MovingAverageForAverageTrueRange)(nil)
+func validMovingAverageForATRCandle(candle core.MarketCandle, lastTimestamp time.Time) bool {
+	if candle == nil {
+		return false
+	}
+
+	timestamp := candle.GetTime()
+
+	if timestamp.IsZero() {
+		return false
+	}
+
+	if !lastTimestamp.IsZero() && !timestamp.After(lastTimestamp) {
+		return false
+	}
+
+	open := candle.GetOpen()
+	high := candle.GetHigh()
+	low := candle.GetLow()
+	closePrice := candle.GetClose()
+
+	for _, value := range []float64{open, high, low, closePrice} {
+		if math.IsNaN(value) ||
+			math.IsInf(value, 0) ||
+			value <= 0 {
+			return false
+		}
+	}
+
+	if high < low {
+		return false
+	}
+
+	if high < math.Max(open, closePrice) {
+		return false
+	}
+
+	if low > math.Min(open, closePrice) {
+		return false
+	}
+
+	return true
+}

@@ -59,11 +59,6 @@ import (
 // The period is read from config.
 // Zero is the reference level, not a configurable period.
 
-type ROCConfig struct {
-	Period         int
-	CandleInterval string
-}
-
 type ROC struct {
 	id string
 
@@ -80,19 +75,20 @@ type ROC struct {
 	result ROCResult
 }
 
-func NewROC(id string, cfg ROCConfig) (*ROC, error) {
+func NewROC(id string, cfg map[string]any) (*ROC, error) {
 	if id == "" {
 		return nil, fmt.Errorf("ROC name cannot be empty")
 	}
 
-	if cfg.Period <= 0 {
-		return nil, fmt.Errorf("ROC period must be positive: %d", cfg.Period)
+	period := cfg["period"].(int)
+	if period <= 0 {
+		return nil, fmt.Errorf("ROC period must be positive: %d", period)
 	}
 
 	return &ROC{
 		id:             id,
-		period:         cfg.Period,
-		candleInterval: cfg.CandleInterval,
+		period:         period,
+		candleInterval: cfg["candleInterval"].(string),
 	}, nil
 }
 

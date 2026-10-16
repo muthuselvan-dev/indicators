@@ -9,26 +9,20 @@ import (
 
 // describe: Short Buildup
 //
-// Short Buildup occurs when price decreases while
-// Open Interest increases.
-//
-// This generally indicates fresh short positions
-// entering the market.
+// Short Buildup occurs when price decreases
+// and Open Interest increases.
 //
 // pipeConfigs: [
-//
-//	{
-//	  type: 'shortBuildup',
-//	  name: 'shortBuildup',
-//	  config: {
-//	    candleInterval: '1 minutes',
-//	  },
-//	}
-//
+//   {
+//     type: 'shortBuildup',
+//     name: 'shortBuildup',
+//     config: {
+//       candleInterval: '1 minutes',
+//     }
+//   }
 // ]
 //
 // Available result:
-//
 //   - Current
 //   - Previous
 //   - PriceChange
@@ -42,7 +36,7 @@ import (
 //     Current == true
 //
 //   Short Buildup Becomes True:
-//     !Previous && Current
+//     Previous == false && Current == true
 //
 // Exit Condition:
 //
@@ -50,79 +44,50 @@ import (
 //     Current == false
 //
 //   Short Buildup Becomes False:
-//     Previous && !Current
+//     Previous == true && Current == false
 //
-// Original Classification Rule:
+// Formula:
 //
-//   PriceChange = CurrentClose - PreviousClose
+// PriceChange = CurrentClose - PreviousClose
+// OpenInterestChange = CurrentOI - PreviousOI
 //
-//   OpenInterestChange = CurrentOI - PreviousOI
-//
-//   ShortBuildup =
-//     (PriceChange < 0) && (OpenInterestChange > 0)
-//
-// BaseResult:
-//
-//   Current:
-//     Latest Short Buildup classification.
-//
-//   Previous:
-//     Previous ready Short Buildup classification.
-//
-//   PriceChange:
-//     Current close minus previous close.
-//
-//   OpenInterestChange:
-//     Current OI minus previous OI.
+// ShortBuildup =
+//   (PriceChange < 0) && (OpenInterestChange > 0)
 //
 // Warmup:
-//
-//   First valid candle stores reference values.
-//   Second valid candle produces first ready result.
-//
-// Reference:
-// https://www.nseindia.com/learn/overview-about-derivatives
+// First valid candle stores reference values.
+// Second valid candle produces first ready result.
 //
 // Note:
 // QuantMan exact classification parity is not verified.
 
-type ShortBuildupConfig struct {
-	CandleInterval string
-}
-
-type ShortBuildupResult struct {
-	IsReady            bool
-	Current            bool
-	Previous           bool
-	PriceChange        float64
-	OpenInterestChange float64
-	Timestamp          time.Time
-}
-
 type ShortBuildup struct {
-	id             string
+	id string
+
 	candleInterval string
 
-	hasClose      bool
 	previousClose float64
 	previousOI    float64
-
-	lastTimestamp time.Time
+	hasClose      bool
 
 	hasResult bool
 	lastValue bool
 
+	lastTimestamp time.Time
+
 	result ShortBuildupResult
 }
 
-func NewShortBuildup(id string, cfg ShortBuildupConfig) (*ShortBuildup, error) {
+func NewShortBuildup(id string, cfg map[string]any) (*ShortBuildup, error) {
 	if id == "" {
-		return nil, fmt.Errorf("ShortBuildup name cannot be empty")
+		return nil, fmt.Errorf("Short Buildup name cannot be empty")
 	}
+
+	candleInterval, _ := cfg["candleInterval"].(string)
 
 	return &ShortBuildup{
 		id:             id,
-		candleInterval: cfg.CandleInterval,
+		candleInterval: candleInterval,
 	}, nil
 }
 
@@ -136,8 +101,7 @@ func (r *ShortBuildup) Result() any {
 }
 
 func (r *ShortBuildup) ingest(candle core.MarketCandle) {
-	if !validShortBuildupCandle(candle, r.lastTimestamp) {
-		r.result = ShortBuildupResult{}
+	if candle == nil {
 		return
 	}
 
@@ -145,11 +109,30 @@ func (r *ShortBuildup) ingest(candle core.MarketCandle) {
 	openInterest := candle.GetOpenInterest()
 	timestamp := candle.GetTime()
 
-	// First valid candle stores reference values.
+	// Reject invalid candle data.
+	if timestamp.IsZero() ||
+		math.IsNaN(closePrice) ||
+		math.IsInf(closePrice, 0) ||
+		closePrice <= 0 ||
+		math.IsNaN(openInterest) ||
+		math.IsInf(openInterest, 0) ||
+		openInterest < 0 ||
+		(!r.lastTimestamp.IsZero() &&
+			!timestamp.After(r.lastTimestamp)) {
+
+		r.result = ShortBuildupResult{
+			IsReady:   false,
+			Timestamp: timestamp,
+		}
+		return
+	}
+
+	r.lastTimestamp = timestamp
+
+	// First valid candle provides reference values.
 	if !r.hasClose {
 		r.previousClose = closePrice
 		r.previousOI = openInterest
-		r.lastTimestamp = timestamp
 		r.hasClose = true
 
 		r.result = ShortBuildupResult{
@@ -166,7 +149,6 @@ func (r *ShortBuildup) ingest(candle core.MarketCandle) {
 	// Update reference values.
 	r.previousClose = closePrice
 	r.previousOI = openInterest
-	r.lastTimestamp = timestamp
 
 	// Short Buildup classification.
 	current := priceChange < 0 && openInterestChange > 0
@@ -189,40 +171,4 @@ func (r *ShortBuildup) ingest(candle core.MarketCandle) {
 	r.hasResult = true
 }
 
-func validShortBuildupCandle(
-	candle core.MarketCandle,
-	lastTimestamp time.Time,
-) bool {
-	if candle == nil {
-		return false
-	}
-
-	timestamp := candle.GetTime()
-
-	if timestamp.IsZero() {
-		return false
-	}
-
-	// Reject duplicate and out-of-order candles.
-	if !lastTimestamp.IsZero() &&
-		!timestamp.After(lastTimestamp) {
-		return false
-	}
-
-	closePrice := candle.GetClose()
-	openInterest := candle.GetOpenInterest()
-
-	if math.IsNaN(closePrice) ||
-		math.IsInf(closePrice, 0) ||
-		closePrice <= 0 {
-		return false
-	}
-
-	if math.IsNaN(openInterest) ||
-		math.IsInf(openInterest, 0) ||
-		openInterest < 0 {
-		return false
-	}
-
-	return true
-}
+var _ core.Indicator = (*ShortBuildup)(nil)

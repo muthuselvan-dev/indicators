@@ -7,212 +7,305 @@ import (
 	"time"
 )
 
-// describe: Moving Average For RSI
+// Indicator: Moving Average For RSI
 //
-// pipeConfigs: [
-//   {type: 'movingAverageForRSI', name: 'movingAverageForRSI', config: {period: 14, candleInterval: '1 minutes'}},
-// ]
+// QuantMan Original Config:
+//   noOfCandlesForRSI: 14
+//   noOfCandlesForMA: 9
+//   candleInterval: "1 minutes"
 //
-// Available result:
-//   - Current, Previous, IsReady, Timestamp
+// Go Pipe Config:
+//   Type: "movingAverageForRSI"
+//   Name: "movingAverageForRSI"
+//   Config: map[string]any{
+//       "rsiPeriod":      14,
+//       "maPeriod":       9,
+//       "candleInterval": "1 minutes",
+//   }
 //
-// Entry Condition:
-//   Is Above threshold: Current > threshold
-//   Crosses Above threshold: Previous <= threshold && Current > threshold
+// Formula:
 //
-// Exit Condition:
-//   Is Below threshold: Current < threshold
-//   Crosses Below threshold: Previous >= threshold && Current < threshold
+//   Change = Close - PreviousClose
 //
-// Original Formula / Explicit Interpretation:
-//   Wilder RSI with period P; Current=SMA(RSI,Q).
+//   Gain = Max(Change, 0)
+//   Loss = Max(-Change, 0)
 //
-// Source: Standard OHLC arithmetic; QuantMan-specific semantics not verified.
-// Example config values are NOT claimed QuantMan defaults.
-// Warm-up: depends on period and prior-session availability.
+//   InitialAverageGain = SMA(Gain, RSIPeriod)
+//   InitialAverageLoss = SMA(Loss, RSIPeriod)
+//
+//   WilderAverageGain =
+//       (PreviousAverageGain * (RSIPeriod - 1) + Gain) / RSIPeriod
+//
+//   WilderAverageLoss =
+//       (PreviousAverageLoss * (RSIPeriod - 1) + Loss) / RSIPeriod
+//
+//   RS = AverageGain / AverageLoss
+//
+//   RSI = 100 - 100 / (1 + RS)
+//
+//   MovingAverageForRSI = SMA(RSI, MAPeriod)
+//
+// Warmup:
+//   RSIPeriod + MAPeriod valid candles.
+//
+// Result:
+//   Current  = SMA of RSI
+//   Previous = Previous ready SMA of RSI
+//   IsReady
+//   Timestamp
+//
+// Note:
+//   Standard Wilder RSI with SMA smoothing.
+//   QuantMan exact calculation parity is not yet verified.
 
 type MovingAverageForRelativeStrengthIndexConfig struct {
-	Period         int
-	Multiplier     float64
-	MaxBodyRatio   float64
+	RSIPeriod      int
+	MAPeriod       int
 	CandleInterval string
 }
+
 type MovingAverageForRelativeStrengthIndex struct {
-	id               string
-	cfg              MovingAverageForRelativeStrengthIndexConfig
-	candles          []movingaverageforrelativestrengthindexSnapshotInternal
-	lastTime         time.Time
-	hasResult        bool
-	result           ScalarResult
-	sessionDay       string
-	sessionOpen      float64
-	sessionHigh      float64
-	sessionLow       float64
-	previousDayClose float64
-	hasPreviousDay   bool
-}
-type MovingAverageForRelativeStrengthIndexSnapshot struct {
-	Open, High, Low, Close float64
-	Timestamp              time.Time
-}
-type movingaverageforrelativestrengthindexSnapshotInternal struct {
-	open, high, low, close float64
-	timestamp              time.Time
+	id  string
+	cfg MovingAverageForRelativeStrengthIndexConfig
+
+	previousClose float64
+	hasPrevious   bool
+
+	gainSum float64
+	lossSum float64
+
+	averageGain float64
+	averageLoss float64
+
+	changeCount int
+	rsiReady    bool
+
+	rsiValues []float64
+	rsiSum    float64
+
+	lastTime time.Time
+
+	hasResult bool
+	lastValue float64
+
+	result ScalarResult
 }
 
-func NewMovingAverageForRelativeStrengthIndex(id string, cfg MovingAverageForRelativeStrengthIndexConfig) (*MovingAverageForRelativeStrengthIndex, error) {
-	if id == "" || cfg.Period <= 0 {
-		return nil, fmt.Errorf("Moving Average For RSI: name and positive period required")
+func NewMovingAverageForRelativeStrengthIndex(id string, cfg map[string]any) (*MovingAverageForRelativeStrengthIndex, error) {
+	if id == "" {
+		return nil, fmt.Errorf("movingAverageForRSI: indicator id is required")
 	}
-	if cfg.Multiplier < 0 || cfg.MaxBodyRatio < 0 {
-		return nil, fmt.Errorf("Moving Average For RSI: invalid multiplier/ratio")
+
+	config := MovingAverageForRelativeStrengthIndexConfig{
+		RSIPeriod:      14,
+		MAPeriod:       9,
+		CandleInterval: "1 minutes",
 	}
-	return &MovingAverageForRelativeStrengthIndex{id: id, cfg: cfg}, nil
+
+	if value, exists := cfg["rsiPeriod"]; exists {
+		period, ok := value.(int)
+		if !ok {
+			return nil, fmt.Errorf("movingAverageForRSI: rsiPeriod must be an integer")
+		}
+		config.RSIPeriod = period
+	}
+
+	if value, exists := cfg["maPeriod"]; exists {
+		period, ok := value.(int)
+		if !ok {
+			return nil, fmt.Errorf("movingAverageForRSI: maPeriod must be an integer")
+		}
+		config.MAPeriod = period
+	}
+
+	if value, exists := cfg["candleInterval"]; exists {
+		interval, ok := value.(string)
+		if !ok || interval == "" {
+			return nil, fmt.Errorf("movingAverageForRSI: invalid candleInterval")
+		}
+		config.CandleInterval = interval
+	}
+
+	if config.RSIPeriod <= 0 {
+		return nil, fmt.Errorf("movingAverageForRSI: rsiPeriod must be positive")
+	}
+
+	if config.MAPeriod <= 0 {
+		return nil, fmt.Errorf("movingAverageForRSI: maPeriod must be positive")
+	}
+
+	return &MovingAverageForRelativeStrengthIndex{
+		id:        id,
+		cfg:       config,
+		rsiValues: make([]float64, 0, config.MAPeriod),
+	}, nil
 }
-func (r *MovingAverageForRelativeStrengthIndex) Update(c core.MarketCandle) any {
-	r.ingest(c)
+
+func (r *MovingAverageForRelativeStrengthIndex) Update(candle core.MarketCandle) any {
+	r.ingest(candle)
 	return r.result
 }
-func (r *MovingAverageForRelativeStrengthIndex) Result() any { return r.result }
-func (r *MovingAverageForRelativeStrengthIndex) ingest(c core.MarketCandle) {
-	if c == nil {
+
+func (r *MovingAverageForRelativeStrengthIndex) Result() any {
+	return r.result
+}
+
+func (r *MovingAverageForRelativeStrengthIndex) ingest(candle core.MarketCandle) {
+	if !validMovingAverageForRSICandle(candle, r.lastTime) {
+		r.result.IsReady = false
 		return
 	}
-	t := c.GetTime()
-	o, h, l, cl := c.GetOpen(), c.GetHigh(), c.GetLow(), c.GetClose()
-	if t.IsZero() || (!r.lastTime.IsZero() && !t.After(r.lastTime)) || o <= 0 || h < l || h < math.Max(o, cl) || l > math.Min(o, cl) || math.IsNaN(cl) || math.IsInf(cl, 0) {
-		r.result = ScalarResult{Timestamp: t}
-		return
-	}
-	r.lastTime = t
-	day := t.Format("2006-01-02")
-	newDay := day != r.sessionDay
-	if newDay {
-		if r.sessionDay != "" {
-			r.previousDayClose = r.candles[len(r.candles)-1].close
-			r.hasPreviousDay = true
+
+	timestamp := candle.GetTime()
+	closePrice := candle.GetClose()
+
+	r.lastTime = timestamp
+
+	// Step 1: First candle initializes previous close.
+	if !r.hasPrevious {
+		r.previousClose = closePrice
+		r.hasPrevious = true
+
+		r.result = ScalarResult{
+			IsReady:   false,
+			Timestamp: timestamp,
 		}
-		r.sessionDay = day
-		r.sessionOpen = o
-		r.sessionHigh = h
-		r.sessionLow = l
+		return
+	}
+
+	// Step 2: Calculate price change.
+	change := closePrice - r.previousClose
+	r.previousClose = closePrice
+
+	gain := math.Max(change, 0)
+	loss := math.Max(-change, 0)
+
+	// Step 3: Initialize Wilder RSI using SMA.
+	if !r.rsiReady {
+		r.gainSum += gain
+		r.lossSum += loss
+		r.changeCount++
+
+		if r.changeCount < r.cfg.RSIPeriod {
+			r.result = ScalarResult{
+				IsReady:   false,
+				Timestamp: timestamp,
+			}
+			return
+		}
+
+		r.averageGain = r.gainSum / float64(r.cfg.RSIPeriod)
+		r.averageLoss = r.lossSum / float64(r.cfg.RSIPeriod)
+
+		r.rsiReady = true
 	} else {
-		if h > r.sessionHigh {
-			r.sessionHigh = h
-		}
-		if l < r.sessionLow {
-			r.sessionLow = l
-		}
+		// Step 4: Wilder recursive smoothing.
+		period := float64(r.cfg.RSIPeriod)
+
+		r.averageGain = (r.averageGain*(period-1) + gain) / period
+
+		r.averageLoss = (r.averageLoss*(period-1) + loss) / period
 	}
-	s := movingaverageforrelativestrengthindexSnapshotInternal{open: o, high: h, low: l, close: cl, timestamp: t}
-	previous := movingaverageforrelativestrengthindexSnapshotInternal{}
-	hasPrevious := len(r.candles) > 0
-	if hasPrevious {
-		previous = r.candles[len(r.candles)-1]
+
+	// Step 5: Calculate RSI.
+	rsi := 50.0
+
+	if r.averageLoss == 0 {
+		if r.averageGain > 0 {
+			rsi = 100
+		}
+	} else {
+		rs := r.averageGain / r.averageLoss
+		rsi = 100 - 100/(1+rs)
 	}
-	r.candles = append(r.candles, s)
-	n := r.cfg.Period
-	if len(r.candles) > n+2 {
-		r.candles = r.candles[len(r.candles)-(n+2):]
+
+	// Step 6: Maintain RSI moving-average window.
+	r.rsiValues = append(r.rsiValues, rsi)
+	r.rsiSum += rsi
+
+	if len(r.rsiValues) > r.cfg.MAPeriod {
+		r.rsiSum -= r.rsiValues[0]
+		r.rsiValues = r.rsiValues[1:]
 	}
-	current := 0.0
-	ready := false
-	switch "rsima" {
-	case "previous":
-		if hasPrevious {
-			current = previous.close
-			ready = true
+
+	// Step 7: Wait for MA warmup.
+	if len(r.rsiValues) < r.cfg.MAPeriod {
+		r.result = ScalarResult{
+			IsReady:   false,
+			Timestamp: timestamp,
 		}
-	case "indecision", "indecision_value":
-		if hasPrevious && previous.high > previous.low {
-			ratio := math.Abs(previous.close-previous.open) / (previous.high - previous.low)
-			if "rsima" == "indecision_value" {
-				current = ratio
-			} else if ratio <= r.cfg.MaxBodyRatio {
-				current = 1
-			}
-			ready = true
-		}
-	case "at":
-		if len(r.candles) > n {
-			current = r.candles[len(r.candles)-1-n].close
-			ready = true
-		}
-	case "lastn":
-		if len(r.candles) >= n {
-			for _, x := range r.candles[len(r.candles)-n:] {
-				current += x.close
-			}
-			current /= float64(n)
-			ready = true
-		}
-	case "today":
-		current = cl
-		ready = true
-	case "prevday":
-		if r.hasPreviousDay {
-			current = r.previousDayClose
-			ready = true
-		}
-	case "gap":
-		if r.hasPreviousDay {
-			current = r.sessionOpen - r.previousDayClose
-			ready = true
-		}
-	case "orb":
-		if len(r.candles) >= n {
-			high := r.candles[len(r.candles)-n].high
-			for _, x := range r.candles[len(r.candles)-n:] {
-				if x.high > high {
-					high = x.high
-				}
-			}
-			current = cl - high
-			ready = true
-		}
-	case "range":
-		if len(r.candles) > n {
-			high := r.candles[len(r.candles)-1-n].high
-			for _, x := range r.candles[len(r.candles)-1-n : len(r.candles)-1] {
-				if x.high > high {
-					high = x.high
-				}
-			}
-			current = cl - high
-			ready = true
-		}
-	case "mrc":
-		if len(r.candles) >= n {
-			for _, x := range r.candles[len(r.candles)-n:] {
-				current += x.close
-			}
-			current /= float64(n)
-			ready = true
-		}
-	case "atrma":
-		if len(r.candles) >= n+1 {
-			for i := len(r.candles) - n; i < len(r.candles); i++ {
-				x, p := r.candles[i], r.candles[i-1]
-				tr := math.Max(x.high-x.low, math.Max(math.Abs(x.high-p.close), math.Abs(x.low-p.close)))
-				current += tr
-			}
-			current /= float64(n)
-			ready = true
-		}
-	case "rsima":
-		// RSI-of-RSI smoothing requires a separate RSI lookback; fail closed until configured.
-		ready = false
-	}
-	if !ready {
-		r.result = ScalarResult{Timestamp: t}
 		return
 	}
-	prev := current
-	if r.hasResult {
-		prev = r.result.Current
+
+	// Step 8: Calculate SMA of RSI.
+	current := r.rsiSum / float64(r.cfg.MAPeriod)
+
+	if math.IsNaN(current) || math.IsInf(current, 0) {
+		r.result = ScalarResult{
+			IsReady:   false,
+			Timestamp: timestamp,
+		}
+		return
 	}
-	r.result = ScalarResult{IsReady: true, Current: current, Previous: prev, Timestamp: t}
+
+	// Step 9: Previous ready value.
+	previous := current
+
+	if r.hasResult {
+		previous = r.lastValue
+	}
+
+	// Step 10: Store result.
+	r.result = ScalarResult{
+		IsReady:   true,
+		Current:   current,
+		Previous:  previous,
+		Timestamp: timestamp,
+	}
+
+	r.lastValue = current
 	r.hasResult = true
 }
 
-var _ core.Indicator = (*MovingAverageForRelativeStrengthIndex)(nil)
+func validMovingAverageForRSICandle(candle core.MarketCandle, lastTimestamp time.Time) bool {
+	if candle == nil {
+		return false
+	}
+
+	timestamp := candle.GetTime()
+
+	if timestamp.IsZero() {
+		return false
+	}
+
+	if !lastTimestamp.IsZero() && !timestamp.After(lastTimestamp) {
+		return false
+	}
+
+	open := candle.GetOpen()
+	high := candle.GetHigh()
+	low := candle.GetLow()
+	closePrice := candle.GetClose()
+
+	for _, value := range []float64{open, high, low, closePrice} {
+		if math.IsNaN(value) ||
+			math.IsInf(value, 0) ||
+			value <= 0 {
+			return false
+		}
+	}
+
+	if high < low {
+		return false
+	}
+
+	if high < math.Max(open, closePrice) {
+		return false
+	}
+
+	if low > math.Min(open, closePrice) {
+		return false
+	}
+
+	return true
+}

@@ -7,88 +7,58 @@ import (
 	"time"
 )
 
-// describe: Average True Range (ATR) - Wilder's volatility indicator
+// Indicator Name: Average True Range (ATR)
 //
-// pipeConfigs: [
+// Pipe Config:
 //
 //	{
-//	  type: 'averageTrueRange',
-//	  name: 'averageTrueRange',
-//	  config: {
-//	    noOfCandles: 14,
-//	    candleInterval: '1 minutes',
-//	  }
+//	  Type: "averageTrueRange",
+//	  Name: "averageTrueRange",
+//	  Config: map[string]any{
+//	    "period":         14,
+//	    "candleInterval": "1 minutes",
+//	  },
 //	}
 //
-// ],
+// Entry Condition (example):
+//   ATR Is Above Threshold:
+//     Current > Threshold
 //
-// Available result:
+//   ATR Crosses Above Threshold:
+//     Previous <= Threshold && Current > Threshold
 //
-//   - Average True Range (Current, Previous, IsReady, Timestamp)
+// Exit Condition (example):
+//   ATR Is Below Threshold:
+//     Current < Threshold
 //
-// Entry Condition:
-//
-//	ATR Is Above Threshold:
-//	  Current > Threshold
-//
-//	ATR Crosses Above Threshold:
-//	  Previous <= Threshold && Current > Threshold
-//
-// Exit Condition:
-//
-//	ATR Is Below Threshold:
-//	  Current < Threshold
-//
-//	ATR Crosses Below Threshold:
-//	  Previous >= Threshold && Current < Threshold
+//   ATR Crosses Below Threshold:
+//     Previous >= Threshold && Current < Threshold
 //
 // Original Formula (Wilder):
 //
-//	TrueRange = Max(
-//	  High - Low,
-//	  Abs(High - PreviousClose),
-//	  Abs(Low - PreviousClose)
-//	)
+//   TR = Max(
+//       High - Low,
+//       Abs(High - PreviousClose),
+//       Abs(Low - PreviousClose)
+//   )
 //
-//	FirstATR = Sum(First N TrueRanges) / N
+//   FirstATR = Sum(First N TrueRanges) / N
 //
-//	NextATR = ((PreviousATR * (N - 1)) + TrueRange) / N
+//   NextATR =
+//       (PreviousATR * (N - 1) + TR) / N
 //
-// BaseResult:
+// Result:
+//   Current, Previous, IsReady, Timestamp
 //
-//	Current:
-//	  Latest ATR value.
-//
-//	Previous:
-//	  Previous ready ATR value.
-//
-//	IsReady:
-//	  True after N valid candles.
-//
-//	Timestamp:
-//	  Timestamp of the latest processed valid candle.
-//
-// Warmup:
-//
-//	The first candle's TrueRange is High - Low.
-//	The first ready result requires N valid candles.
-//	Previous equals Current on the first ready candle.
-//
-// Reference:
-// https://chartschool.stockcharts.com/table-of-contents/technical-indicators-and-overlays/technical-indicators/average-true-range-atr
-//
-// Note:
-// QuantMan exact calculation parity has not been verified.
 
 type AverageTrueRangeConfig struct {
-	NoOfCandles    int
+	Period         int
 	CandleInterval string
 }
 
 type AverageTrueRange struct {
-	id             string
-	period         int
-	candleInterval string
+	id  string
+	cfg AverageTrueRangeConfig
 
 	previousClose float64
 	hasClose      bool
@@ -105,22 +75,54 @@ type AverageTrueRange struct {
 	result AverageTrueRangeResult
 }
 
-func NewAverageTrueRange(id string, cfg AverageTrueRangeConfig) (*AverageTrueRange, error) {
+func NewAverageTrueRange(id string, cfg map[string]any) (*AverageTrueRange, error) {
+
 	if id == "" {
-		return nil, fmt.Errorf("ATR name cannot be empty")
+		return nil, fmt.Errorf(
+			"averageTrueRange: indicator id is required",
+		)
 	}
 
-	if cfg.NoOfCandles <= 0 {
+	config := AverageTrueRangeConfig{
+		Period:         14,
+		CandleInterval: "1 minutes",
+	}
+
+	// Read period from pipe config.
+	if value, exists := cfg["period"]; exists {
+		period, ok := value.(int)
+
+		if !ok {
+			return nil, fmt.Errorf(
+				"averageTrueRange: period must be an integer",
+			)
+		}
+
+		config.Period = period
+	}
+
+	// Read candle interval from pipe config.
+	if value, exists := cfg["candleInterval"]; exists {
+		interval, ok := value.(string)
+
+		if !ok || interval == "" {
+			return nil, fmt.Errorf(
+				"averageTrueRange: invalid candleInterval",
+			)
+		}
+
+		config.CandleInterval = interval
+	}
+
+	if config.Period <= 0 {
 		return nil, fmt.Errorf(
-			"ATR period must be positive: %d",
-			cfg.NoOfCandles,
+			"averageTrueRange: period must be positive",
 		)
 	}
 
 	return &AverageTrueRange{
-		id:             id,
-		period:         cfg.NoOfCandles,
-		candleInterval: cfg.CandleInterval,
+		id:  id,
+		cfg: config,
 	}, nil
 }
 
@@ -134,8 +136,10 @@ func (a *AverageTrueRange) Result() any {
 }
 
 func (a *AverageTrueRange) ingest(candle core.MarketCandle) {
-	
+
 	if !validAverageTrueRangeCandle(candle, a.lastTimestamp) {
+		// Prevent stale results from being used as new signals.
+		a.result.IsReady = false
 		return
 	}
 
@@ -144,7 +148,7 @@ func (a *AverageTrueRange) ingest(candle core.MarketCandle) {
 	closePrice := candle.GetClose()
 	timestamp := candle.GetTime()
 
-	// Calculate True Range.
+	// Step 1: True Range.
 	trueRange := high - low
 
 	if a.hasClose {
@@ -157,18 +161,16 @@ func (a *AverageTrueRange) ingest(candle core.MarketCandle) {
 		)
 	}
 
-	// Update previous close and timestamp.
 	a.previousClose = closePrice
 	a.hasClose = true
 	a.lastTimestamp = timestamp
 
-	// Initial ATR calculation.
-	if a.count < a.period {
+	// Step 2: First ATR using SMA.
+	if a.count < a.cfg.Period {
 		a.seedSum += trueRange
 		a.count++
 
-		// Wait until N valid candles.
-		if a.count < a.period {
+		if a.count < a.cfg.Period {
 			a.result = AverageTrueRangeResult{
 				BaseResult: BaseResult{
 					IsReady:   false,
@@ -178,14 +180,13 @@ func (a *AverageTrueRange) ingest(candle core.MarketCandle) {
 			return
 		}
 
-		// First ATR = Arithmetic mean of first N true ranges.
-		a.atr = a.seedSum / float64(a.period)
+		a.atr = a.seedSum / float64(a.cfg.Period)
+
 	} else {
-		// Wilder smoothing.
-		a.atr = (a.atr*float64(a.period-1) + trueRange) / float64(a.period)
+		// Step 3: Wilder smoothing.
+		a.atr = (a.atr*float64(a.cfg.Period-1) + trueRange) / float64(a.cfg.Period)
 	}
 
-	// Previous equals Current on first ready candle.
 	previous := a.atr
 
 	if a.hasResult {
@@ -205,8 +206,6 @@ func (a *AverageTrueRange) ingest(candle core.MarketCandle) {
 	a.hasResult = true
 }
 
-// Own helper function for Average True Range.
-
 func validAverageTrueRangeCandle(candle core.MarketCandle, lastTimestamp time.Time) bool {
 
 	if candle == nil {
@@ -219,7 +218,6 @@ func validAverageTrueRangeCandle(candle core.MarketCandle, lastTimestamp time.Ti
 		return false
 	}
 
-	// Reject duplicate and out-of-order candles.
 	if !lastTimestamp.IsZero() &&
 		!timestamp.After(lastTimestamp) {
 		return false

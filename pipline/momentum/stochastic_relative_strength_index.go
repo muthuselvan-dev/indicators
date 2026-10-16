@@ -81,14 +81,6 @@ import (
 // rsiPeriod + stochasticPeriod + smoothK + smoothD - 1
 // valid closing prices.
 
-type StochasticRSIConfig struct {
-	RSIPeriod        int
-	StochasticPeriod int
-	SmoothK          int
-	SmoothD          int
-	CandleInterval   string
-}
-
 type StochasticRSI struct {
 	id string
 
@@ -121,25 +113,45 @@ type StochasticRSI struct {
 	result StochasticRSIResult
 }
 
-func NewStochasticRSI(id string, cfg StochasticRSIConfig) (*StochasticRSI, error) {
+func NewStochasticRSI(id string, cfg map[string]any) (*StochasticRSI, error) {
 	if id == "" {
 		return nil, fmt.Errorf("stochastic RSI name cannot be empty")
 	}
 
-	if cfg.RSIPeriod <= 0 ||
-		cfg.StochasticPeriod <= 0 ||
-		cfg.SmoothK <= 0 ||
-		cfg.SmoothD <= 0 {
+	rsiPeriod, err := cfg["rsiPeriod"].(int)
+	if !err {
+		return nil, fmt.Errorf("stochastic RSI rsiPeriod must be an integer")
+	}
+
+	stochasticPeriod, err := cfg["stochasticPeriod"].(int)
+	if !err {
+		return nil, fmt.Errorf("stochastic RSI stochasticPeriod must be an integer")
+	}
+
+	smoothK, err := cfg["kPeriod"].(int)
+	if !err {
+		return nil, fmt.Errorf("stochastic RSI kPeriod must be an integer")
+	}
+
+	smoothD, err := cfg["dPeriod"].(int)
+	if !err {
+		return nil, fmt.Errorf("stochastic RSI smoothD must be an integer")
+	}
+
+	if rsiPeriod <= 0 ||
+		stochasticPeriod <= 0 ||
+		smoothK <= 0 ||
+		smoothD <= 0 {
 		return nil, fmt.Errorf("stochastic RSI periods must be positive")
 	}
 
 	return &StochasticRSI{
 		id:               id,
-		rsiPeriod:        cfg.RSIPeriod,
-		stochasticPeriod: cfg.StochasticPeriod,
-		smoothK:          cfg.SmoothK,
-		smoothD:          cfg.SmoothD,
-		candleInterval:   cfg.CandleInterval,
+		rsiPeriod:        rsiPeriod,
+		stochasticPeriod: stochasticPeriod,
+		smoothK:          smoothK,
+		smoothD:          smoothD,
+		candleInterval:   cfg["candleInterval"].(string),
 	}, nil
 }
 

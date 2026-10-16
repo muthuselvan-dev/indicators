@@ -4,214 +4,171 @@ import (
 	"fmt"
 	"indicators/core"
 	"math"
+	"strings"
 	"time"
 )
 
 // describe: Last N Candles
 //
-// pipeConfigs: [
-//   {type: 'lastNCandles', name: 'lastNCandles', config: {period: 14, candleInterval: '1 minutes'}},
-// ]
+// Config:
+// period: 7
+// candleInterval: "1 minutes"
 //
-// Available result:
-//   - Current, Previous, IsReady, Timestamp
+// Current = latest N accepted candles.
+// Previous = preceding N-candle window.
 //
-// Entry Condition:
-//   Is Above threshold: Current > threshold
-//   Crosses Above threshold: Previous <= threshold && Current > threshold
+// No SMA calculation.
+// No additional OHLCV snapshot structs.
 //
-// Exit Condition:
-//   Is Below threshold: Current < threshold
-//   Crosses Below threshold: Previous >= threshold && Current < threshold
-//
-// Original Formula / Explicit Interpretation:
-//   Last N Candles = rolling arithmetic mean of last N closes (explicit local interpretation, NOT verified QuantMan behavior).
-//
-// Source: Standard OHLC arithmetic; QuantMan-specific semantics not verified.
-// Example config values are NOT claimed QuantMan defaults.
-// Warm-up: depends on period and prior-session availability.
+// Note: Rolling-window behavior is a local interpretation.
+// QuantMan exact parity is not yet verified.
 
 type LastNCandlesConfig struct {
 	Period         int
-	Multiplier     float64
-	MaxBodyRatio   float64
 	CandleInterval string
 }
+
 type LastNCandles struct {
-	id               string
-	cfg              LastNCandlesConfig
-	candles          []lastncandlesSnapshotInternal
-	lastTime         time.Time
-	hasResult        bool
-	result           ScalarResult
-	sessionDay       string
-	sessionOpen      float64
-	sessionHigh      float64
-	sessionLow       float64
-	previousDayClose float64
-	lastClose        float64
-	hasPreviousDay   bool
-}
-type LastNCandlesSnapshot struct {
-	Open, High, Low, Close float64
-	Timestamp              time.Time
-}
-type lastncandlesSnapshotInternal struct {
-	open, high, low, close float64
-	timestamp              time.Time
+	id       string
+	cfg      LastNCandlesConfig
+	candles  []core.MarketCandle
+	lastTime time.Time
+	result   LastNCandlesResult
 }
 
-func NewLastNCandles(id string, cfg LastNCandlesConfig) (*LastNCandles, error) {
-	if id == "" || cfg.Period <= 0 {
-		return nil, fmt.Errorf("Last N Candles: name and positive period required")
+func NewLastNCandles(id string, cfg map[string]any) (*LastNCandles, error) {
+	if strings.TrimSpace(id) == "" {
+		return nil, fmt.Errorf("LastNCandles: empty name")
 	}
-	if cfg.Multiplier < 0 || cfg.MaxBodyRatio < 0 {
-		return nil, fmt.Errorf("Last N Candles: invalid multiplier/ratio")
+
+	config := LastNCandlesConfig{
+		CandleInterval: "1 minutes",
 	}
-	return &LastNCandles{id: id, cfg: cfg}, nil
+
+	raw, exists := cfg["period"]
+	if !exists {
+		return nil, fmt.Errorf("LastNCandles: period required")
+	}
+
+	switch v := raw.(type) {
+	case int:
+		config.Period = v
+	case float64:
+		if math.IsNaN(v) || math.IsInf(v, 0) ||
+			math.Trunc(v) != v ||
+			v > float64(int(^uint(0)>>1)) {
+			return nil, fmt.Errorf("LastNCandles: invalid period")
+		}
+		config.Period = int(v)
+	default:
+		return nil, fmt.Errorf("LastNCandles: invalid period type")
+	}
+
+	if config.Period <= 0 {
+		return nil, fmt.Errorf("LastNCandles: period must be positive")
+	}
+
+	if value, exists := cfg["candleInterval"]; exists {
+		s, ok := value.(string)
+		if !ok || strings.TrimSpace(s) == "" {
+			return nil, fmt.Errorf("LastNCandles: invalid candleInterval")
+		}
+		config.CandleInterval = strings.TrimSpace(s)
+	}
+
+	return &LastNCandles{
+		id:      id,
+		cfg:     config,
+		candles: make([]core.MarketCandle, 0, config.Period+1),
+	}, nil
 }
-func (r *LastNCandles) Update(c core.MarketCandle) any { r.ingest(c); return r.result }
-func (r *LastNCandles) Result() any                    { return r.result }
+
+func (r *LastNCandles) Update(c core.MarketCandle) any {
+	r.ingest(c)
+	return r.result
+}
+
+func (r *LastNCandles) Result() any {
+	return r.result
+}
+
 func (r *LastNCandles) ingest(c core.MarketCandle) {
-	if c == nil {
+	if !validLastNCandle(c, r.lastTime) {
 		return
 	}
+
 	t := c.GetTime()
-	o, h, l, cl := c.GetOpen(), c.GetHigh(), c.GetLow(), c.GetClose()
-	if t.IsZero() || (!r.lastTime.IsZero() && !t.After(r.lastTime)) || o <= 0 || h < l || h < math.Max(o, cl) || l > math.Min(o, cl) || math.IsNaN(cl) || math.IsInf(cl, 0) {
-		r.result = ScalarResult{Timestamp: t}
-		return
-	}
-	r.lastTime = t
-	day := t.Format("2006-01-02")
-	newDay := day != r.sessionDay
-	if newDay {
-		if r.sessionDay != "" {
-			r.previousDayClose = r.lastClose
-			r.hasPreviousDay = true
-		}
-		r.sessionDay = day
-		r.sessionOpen = o
-		r.sessionHigh = h
-		r.sessionLow = l
-	} else {
-		if h > r.sessionHigh {
-			r.sessionHigh = h
-		}
-		if l < r.sessionLow {
-			r.sessionLow = l
-		}
-	}
-	r.lastClose = cl
-	s := lastncandlesSnapshotInternal{open: o, high: h, low: l, close: cl, timestamp: t}
-	previous := lastncandlesSnapshotInternal{}
-	hasPrevious := len(r.candles) > 0
-	if hasPrevious {
-		previous = r.candles[len(r.candles)-1]
-	}
-	r.candles = append(r.candles, s)
 	n := r.cfg.Period
-	if len(r.candles) > n+2 {
-		r.candles = r.candles[len(r.candles)-(n+2):]
+
+	r.lastTime = t
+	r.candles = append(r.candles, c)
+
+	if len(r.candles) > n+1 {
+		copy(r.candles, r.candles[1:])
+		r.candles = r.candles[:n+1]
 	}
-	current := 0.0
-	ready := false
-	switch "lastn" {
-	case "previous":
-		if hasPrevious {
-			current = previous.close
-			ready = true
+
+	if len(r.candles) < n {
+		r.result = LastNCandlesResult{
+			Timestamp: t,
 		}
-	case "indecision", "indecision_value":
-		if hasPrevious && previous.high > previous.low {
-			ratio := math.Abs(previous.close-previous.open) / (previous.high - previous.low)
-			if "lastn" == "indecision_value" {
-				current = ratio
-			} else if ratio <= r.cfg.MaxBodyRatio {
-				current = 1
-			}
-			ready = true
-		}
-	case "at":
-		if len(r.candles) > n {
-			current = r.candles[len(r.candles)-1-n].close
-			ready = true
-		}
-	case "lastn":
-		if len(r.candles) >= n {
-			for _, x := range r.candles[len(r.candles)-n:] {
-				current += x.close
-			}
-			current /= float64(n)
-			ready = true
-		}
-	case "today":
-		current = cl
-		ready = true
-	case "prevday":
-		if r.hasPreviousDay {
-			current = r.previousDayClose
-			ready = true
-		}
-	case "gap":
-		if r.hasPreviousDay {
-			current = r.sessionOpen - r.previousDayClose
-			ready = true
-		}
-	case "orb":
-		if len(r.candles) >= n {
-			high := r.candles[len(r.candles)-n].high
-			for _, x := range r.candles[len(r.candles)-n:] {
-				if x.high > high {
-					high = x.high
-				}
-			}
-			current = cl - high
-			ready = true
-		}
-	case "range":
-		if len(r.candles) > n {
-			high := r.candles[len(r.candles)-1-n].high
-			for _, x := range r.candles[len(r.candles)-1-n : len(r.candles)-1] {
-				if x.high > high {
-					high = x.high
-				}
-			}
-			current = cl - high
-			ready = true
-		}
-	case "mrc":
-		if len(r.candles) >= n {
-			for _, x := range r.candles[len(r.candles)-n:] {
-				current += x.close
-			}
-			current /= float64(n)
-			ready = true
-		}
-	case "atrma":
-		if len(r.candles) >= n+1 {
-			for i := len(r.candles) - n; i < len(r.candles); i++ {
-				x, p := r.candles[i], r.candles[i-1]
-				tr := math.Max(x.high-x.low, math.Max(math.Abs(x.high-p.close), math.Abs(x.low-p.close)))
-				current += tr
-			}
-			current /= float64(n)
-			ready = true
-		}
-	case "rsima":
-		// RSI-of-RSI smoothing requires a separate RSI lookback; fail closed until configured.
-		ready = false
-	}
-	if !ready {
-		r.result = ScalarResult{Timestamp: t}
 		return
 	}
-	prev := current
-	if r.hasResult {
-		prev = r.result.Current
+
+	current := make([]core.MarketCandle, n)
+	copy(current, r.candles[len(r.candles)-n:])
+
+	var previous []core.MarketCandle
+
+	if len(r.candles) >= n+1 {
+		previous = make([]core.MarketCandle, n)
+		copy(previous, r.candles[len(r.candles)-n-1:len(r.candles)-1])
+	} else {
+		previous = current
 	}
-	r.result = ScalarResult{IsReady: true, Current: current, Previous: prev, Timestamp: t}
-	r.hasResult = true
+
+	r.result = LastNCandlesResult{
+		IsReady:   true,
+		Current:   current,
+		Previous:  previous,
+		Timestamp: t,
+	}
 }
 
-var _ core.Indicator = (*LastNCandles)(nil)
+func validLastNCandle(c core.MarketCandle, lastTime time.Time) bool {
+	if c == nil {
+		return false
+	}
+
+	t := c.GetTime()
+	if t.IsZero() || (!lastTime.IsZero() && !t.After(lastTime)) {
+		return false
+	}
+
+	o := c.GetOpen()
+	h := c.GetHigh()
+	l := c.GetLow()
+	cl := c.GetClose()
+	v := c.GetVolume()
+	oi := c.GetOpenInterest()
+
+	for _, x := range []float64{o, h, l, cl} {
+		if math.IsNaN(x) || math.IsInf(x, 0) || x <= 0 {
+			return false
+		}
+	}
+
+	for _, x := range []float64{v, oi} {
+		if math.IsNaN(x) || math.IsInf(x, 0) || x <= 0 {
+			if x < 0 || math.IsNaN(x) || math.IsInf(x, 0) {
+				return false
+			}
+		}
+	}
+
+	if h < l || h < math.Max(o, cl) || l > math.Min(o, cl) {
+		return false
+	}
+
+	return true
+}

@@ -93,12 +93,6 @@ import (
 //
 //	QuantMan calculation parity is not yet verified.
 
-type AOConfig struct {
-	FastPeriod     int
-	SlowPeriod     int
-	CandleInterval string
-}
-
 type AO struct {
 	id string
 

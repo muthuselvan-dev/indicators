@@ -4,212 +4,271 @@ import (
 	"fmt"
 	"indicators/core"
 	"math"
+	"strings"
 	"time"
 )
 
-// describe: Range Breakout
+// describe: Time Window Range Breakout
 //
-// pipeConfigs: [
-//   {type: 'rangeBreakout', name: 'rangeBreakout', config: {period: 14, candleInterval: '1 minutes'}},
-// ]
+// QuantMan Config:
+//   type: "candleAt"
+//   name: "RangeBreakout"
+//   config:
+//     candleInterval: "1 minutes"
+//     startTime: "09:30"
+//     endTime: "10:30"
 //
-// Available result:
-//   - Current, Previous, IsReady, Timestamp
+// Standard Range Breakout Formula:
+//   RangeHigh = MAX(High) inside configured time window
+//   RangeLow  = MIN(Low) inside configured time window
 //
-// Entry Condition:
-//   Is Above threshold: Current > threshold
-//   Crosses Above threshold: Previous <= threshold && Current > threshold
+//   Current  = Close - RangeHigh
+//   Breakout =  1 when Close > RangeHigh
+//             -1 when Close < RangeLow
+//              0 otherwise
 //
-// Exit Condition:
-//   Is Below threshold: Current < threshold
-//   Crosses Below threshold: Previous >= threshold && Current < threshold
+// Range is frozen after the configured end time.
+// Daily reset uses the candle timestamp's timezone.
 //
-// Original Formula / Explicit Interpretation:
-//   Range Breakout = CurrentClose - max(High of preceding N candles).
+// NOTE:
+// QuantMan candleAt semantics are not independently verified.
+// This is a time-window breakout implementation, not
+// a confirmed reproduction of QuantMan's candleAt engine.
 //
-// Source: Standard OHLC arithmetic; QuantMan-specific semantics not verified.
-// Example config values are NOT claimed QuantMan defaults.
-// Warm-up: depends on period and prior-session availability.
+// Timestamp assumption:
+// Candle timestamps represent candle opening times.
+// The configured range includes startTime and excludes endTime.
 
 type RangeBreakoutConfig struct {
-	Period         int
-	Multiplier     float64
-	MaxBodyRatio   float64
 	CandleInterval string
-}
-type RangeBreakout struct {
-	id               string
-	cfg              RangeBreakoutConfig
-	candles          []rangebreakoutSnapshotInternal
-	lastTime         time.Time
-	hasResult        bool
-	result           ScalarResult
-	sessionDay       string
-	sessionOpen      float64
-	sessionHigh      float64
-	sessionLow       float64
-	previousDayClose float64
-	hasPreviousDay   bool
-}
-type RangeBreakoutSnapshot struct {
-	Open, High, Low, Close float64
-	Timestamp              time.Time
-}
-type rangebreakoutSnapshotInternal struct {
-	open, high, low, close float64
-	timestamp              time.Time
+	StartTime      string
+	EndTime        string
 }
 
-func NewRangeBreakout(id string, cfg RangeBreakoutConfig) (*RangeBreakout, error) {
-	if id == "" || cfg.Period <= 0 {
-		return nil, fmt.Errorf("Range Breakout: name and positive period required")
-	}
-	if cfg.Multiplier < 0 || cfg.MaxBodyRatio < 0 {
-		return nil, fmt.Errorf("Range Breakout: invalid multiplier/ratio")
-	}
-	return &RangeBreakout{id: id, cfg: cfg}, nil
+type RangeBreakout struct {
+	id  string
+	cfg RangeBreakoutConfig
+
+	lastTime time.Time
+	day      string
+
+	rangeStart time.Time
+	rangeEnd   time.Time
+
+	rangeHigh float64
+	rangeLow  float64
+	hasRange  bool
+
+	hasResult bool
+	result    RangeBreakoutResult
 }
-func (r *RangeBreakout) Update(c core.MarketCandle) any { r.ingest(c); return r.result }
-func (r *RangeBreakout) Result() any                    { return r.result }
-func (r *RangeBreakout) ingest(c core.MarketCandle) {
-	if c == nil {
+
+func NewRangeBreakout(id string, cfg map[string]any) (*RangeBreakout, error) {
+	if strings.TrimSpace(id) == "" {
+		return nil, fmt.Errorf("rangeBreakout: indicator id required")
+	}
+
+	config := RangeBreakoutConfig{
+		CandleInterval: "1 minutes",
+		StartTime:      "09:30",
+		EndTime:        "10:30",
+	}
+
+	if value, exists := cfg["candleInterval"]; exists {
+		v, ok := value.(string)
+		if !ok || strings.TrimSpace(v) == "" {
+			return nil, fmt.Errorf("rangeBreakout: invalid candleInterval")
+		}
+		config.CandleInterval = strings.TrimSpace(v)
+	}
+
+	if value, exists := cfg["startTime"]; exists {
+		v, ok := value.(string)
+		if !ok {
+			return nil, fmt.Errorf("rangeBreakout: invalid startTime")
+		}
+		config.StartTime = v
+	}
+
+	if value, exists := cfg["endTime"]; exists {
+		v, ok := value.(string)
+		if !ok {
+			return nil, fmt.Errorf("rangeBreakout: invalid endTime")
+		}
+		config.EndTime = v
+	}
+
+	start, err := time.Parse("15:04", config.StartTime)
+	if err != nil {
+		return nil, fmt.Errorf("rangeBreakout: startTime must be HH:MM")
+	}
+
+	end, err := time.Parse("15:04", config.EndTime)
+	if err != nil {
+		return nil, fmt.Errorf("rangeBreakout: endTime must be HH:MM")
+	}
+
+	startMinute := start.Hour()*60 + start.Minute()
+	endMinute := end.Hour()*60 + end.Minute()
+
+	if endMinute <= startMinute {
+		return nil, fmt.Errorf("rangeBreakout: endTime must be after startTime")
+	}
+
+	if config.CandleInterval != "1 minutes" {
+		return nil, fmt.Errorf("rangeBreakout: only 1 minutes candles supported")
+	}
+
+	return &RangeBreakout{
+		id:  id,
+		cfg: config,
+	}, nil
+}
+
+func (r *RangeBreakout) Update(candle core.MarketCandle) any {
+	r.ingest(candle)
+	return r.result
+}
+
+func (r *RangeBreakout) Result() any {
+	return r.result
+}
+
+func (r *RangeBreakout) ingest(candle core.MarketCandle) {
+	if !validRangeBreakoutCandle(candle, r.lastTime) {
 		return
 	}
-	t := c.GetTime()
-	o, h, l, cl := c.GetOpen(), c.GetHigh(), c.GetLow(), c.GetClose()
-	if t.IsZero() || (!r.lastTime.IsZero() && !t.After(r.lastTime)) || o <= 0 || h < l || h < math.Max(o, cl) || l > math.Min(o, cl) || math.IsNaN(cl) || math.IsInf(cl, 0) {
-		r.result = ScalarResult{Timestamp: t}
-		return
-	}
+
+	t := candle.GetTime()
+	high := candle.GetHigh()
+	low := candle.GetLow()
+	closePrice := candle.GetClose()
+
 	r.lastTime = t
+
 	day := t.Format("2006-01-02")
-	newDay := day != r.sessionDay
-	if newDay {
-		if r.sessionDay != "" {
-			r.previousDayClose = r.candles[len(r.candles)-1].close
-			r.hasPreviousDay = true
-		}
-		r.sessionDay = day
-		r.sessionOpen = o
-		r.sessionHigh = h
-		r.sessionLow = l
-	} else {
-		if h > r.sessionHigh {
-			r.sessionHigh = h
-		}
-		if l < r.sessionLow {
-			r.sessionLow = l
-		}
+
+	if day != r.day {
+		r.resetSession(t, day)
 	}
-	s := rangebreakoutSnapshotInternal{open: o, high: h, low: l, close: cl, timestamp: t}
-	previous := rangebreakoutSnapshotInternal{}
-	hasPrevious := len(r.candles) > 0
-	if hasPrevious {
-		previous = r.candles[len(r.candles)-1]
-	}
-	r.candles = append(r.candles, s)
-	n := r.cfg.Period
-	if len(r.candles) > n+2 {
-		r.candles = r.candles[len(r.candles)-(n+2):]
-	}
-	current := 0.0
-	ready := false
-	switch "range" {
-	case "previous":
-		if hasPrevious {
-			current = previous.close
-			ready = true
+
+	// Before configured range: not ready.
+	if t.Before(r.rangeStart) {
+		r.result = RangeBreakoutResult{
+			Timestamp: t,
 		}
-	case "indecision", "indecision_value":
-		if hasPrevious && previous.high > previous.low {
-			ratio := math.Abs(previous.close-previous.open) / (previous.high - previous.low)
-			if "range" == "indecision_value" {
-				current = ratio
-			} else if ratio <= r.cfg.MaxBodyRatio {
-				current = 1
-			}
-			ready = true
-		}
-	case "at":
-		if len(r.candles) > n {
-			current = r.candles[len(r.candles)-1-n].close
-			ready = true
-		}
-	case "lastn":
-		if len(r.candles) >= n {
-			for _, x := range r.candles[len(r.candles)-n:] {
-				current += x.close
-			}
-			current /= float64(n)
-			ready = true
-		}
-	case "today":
-		current = cl
-		ready = true
-	case "prevday":
-		if r.hasPreviousDay {
-			current = r.previousDayClose
-			ready = true
-		}
-	case "gap":
-		if r.hasPreviousDay {
-			current = r.sessionOpen - r.previousDayClose
-			ready = true
-		}
-	case "orb":
-		if len(r.candles) >= n {
-			high := r.candles[len(r.candles)-n].high
-			for _, x := range r.candles[len(r.candles)-n:] {
-				if x.high > high {
-					high = x.high
-				}
-			}
-			current = cl - high
-			ready = true
-		}
-	case "range":
-		if len(r.candles) > n {
-			high := r.candles[len(r.candles)-1-n].high
-			for _, x := range r.candles[len(r.candles)-1-n : len(r.candles)-1] {
-				if x.high > high {
-					high = x.high
-				}
-			}
-			current = cl - high
-			ready = true
-		}
-	case "mrc":
-		if len(r.candles) >= n {
-			for _, x := range r.candles[len(r.candles)-n:] {
-				current += x.close
-			}
-			current /= float64(n)
-			ready = true
-		}
-	case "atrma":
-		if len(r.candles) >= n+1 {
-			for i := len(r.candles) - n; i < len(r.candles); i++ {
-				x, p := r.candles[i], r.candles[i-1]
-				tr := math.Max(x.high-x.low, math.Max(math.Abs(x.high-p.close), math.Abs(x.low-p.close)))
-				current += tr
-			}
-			current /= float64(n)
-			ready = true
-		}
-	case "rsima":
-		// RSI-of-RSI smoothing requires a separate RSI lookback; fail closed until configured.
-		ready = false
-	}
-	if !ready {
-		r.result = ScalarResult{Timestamp: t}
 		return
 	}
-	prev := current
-	if r.hasResult {
-		prev = r.result.Current
+
+	// Build range using candles within [start, end).
+	if t.Before(r.rangeEnd) {
+		if !r.hasRange {
+			r.rangeHigh = high
+			r.rangeLow = low
+			r.hasRange = true
+		} else {
+			r.rangeHigh = math.Max(r.rangeHigh, high)
+			r.rangeLow = math.Min(r.rangeLow, low)
+		}
+
+		r.result = RangeBreakoutResult{
+			IsReady:   false,
+			High:      r.rangeHigh,
+			Low:       r.rangeLow,
+			Timestamp: t,
+		}
+		return
 	}
-	r.result = ScalarResult{IsReady: true, Current: current, Previous: prev, Timestamp: t}
+
+	// Cannot calculate without a completed range.
+	if !r.hasRange {
+		r.result = RangeBreakoutResult{
+			Timestamp: t,
+		}
+		return
+	}
+
+	// RangeHigh and RangeLow are frozen after endTime.
+	current := closePrice - r.rangeHigh
+
+	previous := current
+	if r.hasResult {
+		previous = r.result.Current
+	}
+
+	breakout := 0
+
+	if closePrice > r.rangeHigh {
+		breakout = 1
+	} else if closePrice < r.rangeLow {
+		breakout = -1
+	}
+
+	r.result = RangeBreakoutResult{
+		IsReady:   true,
+		Current:   current,
+		Previous:  previous,
+		High:      r.rangeHigh,
+		Low:       r.rangeLow,
+		Breakout:  breakout,
+		Timestamp: t,
+	}
+
 	r.hasResult = true
 }
 
-var _ core.Indicator = (*RangeBreakout)(nil)
+func (r *RangeBreakout) resetSession(t time.Time, day string) {
+	r.day = day
+
+	r.hasRange = false
+	r.hasResult = false
+	r.rangeHigh = 0
+	r.rangeLow = 0
+	r.result = RangeBreakoutResult{}
+
+	start, _ := time.Parse("15:04", r.cfg.StartTime)
+	end, _ := time.Parse("15:04", r.cfg.EndTime)
+
+	r.rangeStart = time.Date(
+		t.Year(), t.Month(), t.Day(),
+		start.Hour(), start.Minute(), 0, 0, t.Location(),
+	)
+
+	r.rangeEnd = time.Date(
+		t.Year(), t.Month(), t.Day(),
+		end.Hour(), end.Minute(), 0, 0, t.Location(),
+	)
+}
+
+func validRangeBreakoutCandle(candle core.MarketCandle, lastTime time.Time) bool {
+	if candle == nil {
+		return false
+	}
+
+	t := candle.GetTime()
+
+	if t.IsZero() {
+		return false
+	}
+
+	if !lastTime.IsZero() && !t.After(lastTime) {
+		return false
+	}
+
+	o := candle.GetOpen()
+	h := candle.GetHigh()
+	l := candle.GetLow()
+	cl := candle.GetClose()
+
+	for _, value := range []float64{o, h, l, cl} {
+		if math.IsNaN(value) || math.IsInf(value, 0) || value <= 0 {
+			return false
+		}
+	}
+
+	if h < l || h < math.Max(o, cl) || l > math.Min(o, cl) {
+		return false
+	}
+
+	return true
+}

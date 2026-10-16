@@ -7,107 +7,86 @@ import (
 	"time"
 )
 
-// describe: Keltner Channel - EMA-based volatility envelope
+// Indicator Name: Keltner Channel
 //
-// pipeConfigs: [
+// QuantMan Pipe Config:
 //
-//	{
-//	  type: 'keltnerChannel',
-//	  name: 'keltnerChannel',
-//	  config: {
-//	    emaPeriod: 20,
-//	    atrPeriod: 10,
-//	    multiplier: 2,
-//	    candleInterval: '1 minutes',
-//	  }
-//	}
-//
-// ],
-//
-// Available result:
-//
-//   - Middle (EMA)
-//   - Upper
-//   - Lower
-//   - Current (Middle)
-//   - Previous
-//   - IsReady
-//   - Timestamp
-//
-// Entry Condition:
-//
-//	Close Is Above Upper Band:
-//	  Close > Upper
-//
-//	Close Crosses Above Upper Band:
-//	  PreviousClose <= PreviousUpper && Close > Upper
-//
-// Exit Condition:
-//
-//	Close Is Below Lower Band:
-//	  Close < Lower
-//
-//	Close Crosses Below Lower Band:
-//	  PreviousClose >= PreviousLower && Close < Lower
+// {
+//     Type: "keltnerChannel",
+//     Name: "keltnerChannel",
+//     Config: map[string]any{
+//         "candleInterval": "1 minutes",
+//         "length":         20,
+//         "multiplier":     2,
+//         "atrLength":      10,
+//     },
+// }
 //
 // Original Formula:
 //
-//	EMA Seed = Sum(First EMA Period Closes) / EMA Period
+//   EMA Seed = SMA(First Length Closes)
 //
-//	EMA Alpha = 2 / (EMA Period + 1)
+//   EMA Alpha = 2 / (Length + 1)
 //
-//	EMA = Alpha * CurrentClose +
-//	      (1 - Alpha) * PreviousEMA
+//   EMA = Alpha * Close + (1 - Alpha) * PreviousEMA
 //
-//	TrueRange = Max(
-//	  High - Low,
-//	  Abs(High - PreviousClose),
-//	  Abs(Low - PreviousClose)
-//	)
+//   TrueRange = Max(
+//       High - Low,
+//       Abs(High - PreviousClose),
+//       Abs(Low - PreviousClose)
+//   )
 //
-//	ATR Seed = Sum(First ATR Period TrueRanges) / ATR Period
+//   ATR Seed = Sum(First ATRLength TrueRanges) / ATRLength
 //
-//	Wilder ATR =
-//	  ((PreviousATR * (ATR Period - 1)) + TrueRange) / ATR Period
+//   Wilder ATR =
+//       (PreviousATR * (ATRLength - 1) + TrueRange) / ATRLength
 //
-//	Middle = EMA(Close, EMA Period)
+//   Middle = EMA(Close, Length)
 //
-//	Upper = Middle + Multiplier * ATR
+//   Upper = Middle + Multiplier * ATR
 //
-//	Lower = Middle - Multiplier * ATR
+//   Lower = Middle - Multiplier * ATR
 //
-// BaseResult:
+// Entry Condition:
 //
-//	Current:
-//	  Latest Middle Band (EMA).
+//   Close Is Above Upper Band:
+//     Close > Upper
 //
-//	Previous:
-//	  Previous ready Middle Band.
+//   Close Crosses Above Upper Band:
+//     PreviousClose <= PreviousUpper && Close > Upper
 //
-//	IsReady:
-//	  True when both EMA and ATR are ready.
+// Exit Condition:
 //
-//	Timestamp:
-//	  Latest processed valid candle timestamp.
+//   Close Is Below Lower Band:
+//     Close < Lower
+//
+//   Close Crosses Below Lower Band:
+//     PreviousClose >= PreviousLower && Close < Lower
+//
+// Result:
+//
+//   Middle
+//   Upper
+//   Lower
+//
+//   BaseResult:
+//     Current   = Middle
+//     Previous  = Previous ready Middle
+//     IsReady
+//     Timestamp
 //
 // Warmup:
-//
-//	EMA requires EMA Period valid closing prices.
-//	ATR uses High - Low for the first candle's True Range.
-//	ATR requires ATR Period valid candles.
-//	First ready result requires Max(EMA Period, ATR Period)
-//	valid candles.
-//
-// Reference:
-// https://chartschool.stockcharts.com/table-of-contents/technical-indicators-and-overlays/technical-overlays/keltner-channels
+//   EMA requires Length valid closes.
+//   ATR requires ATRLength valid candles.
+//   First candle TR = High - Low.
+//   First ready = Max(Length, ATRLength) candles.
 //
 // Note:
-// This implementation uses SMA-seeded EMA and Wilder ATR.
-// QuantMan exact calculation parity has not been verified.
+//   QuantMan exact calculation parity is not verified.
 
 type KeltnerChannelConfig struct {
-	EMAPeriod      int
-	ATRPeriod      int
+	Length         int
+	ATRLength      int
 	Multiplier     float64
 	CandleInterval string
 }
@@ -120,11 +99,8 @@ type KeltnerChannelResult struct {
 }
 
 type KeltnerChannel struct {
-	id             string
-	emaPeriod      int
-	atrPeriod      int
-	multiplier     float64
-	candleInterval string
+	id  string
+	cfg KeltnerChannelConfig
 
 	closeSum   float64
 	closeCount int
@@ -137,7 +113,7 @@ type KeltnerChannel struct {
 	previousClose float64
 	hasClose      bool
 
-	lastTimestamp time.Time
+	lastTime time.Time
 
 	hasResult bool
 	lastValue float64
@@ -145,33 +121,70 @@ type KeltnerChannel struct {
 	result KeltnerChannelResult
 }
 
-func NewKeltnerChannel(id string, cfg KeltnerChannelConfig) (*KeltnerChannel, error) {
+func NewKeltnerChannel(id string, cfg map[string]any) (*KeltnerChannel, error) {
 	if id == "" {
-		return nil, fmt.Errorf("Keltner Channel name cannot be empty")
+		return nil, fmt.Errorf("keltnerChannel: indicator id is required")
 	}
 
-	if cfg.EMAPeriod <= 0 {
-		return nil, fmt.Errorf("Keltner Channel EMA period must be positive")
+	config := KeltnerChannelConfig{
+		Length:         20,
+		ATRLength:      10,
+		Multiplier:     2.0,
+		CandleInterval: "1 minutes",
 	}
 
-	if cfg.ATRPeriod <= 0 {
-		return nil, fmt.Errorf("Keltner Channel ATR period must be positive")
+	if value, exists := cfg["length"]; exists {
+		length, ok := value.(int)
+		if !ok {
+			return nil, fmt.Errorf("keltnerChannel: length must be an integer")
+		}
+		config.Length = length
 	}
 
-	if cfg.Multiplier <= 0 ||
-		math.IsNaN(cfg.Multiplier) ||
-		math.IsInf(cfg.Multiplier, 0) {
-		return nil, fmt.Errorf(
-			"Keltner Channel multiplier must be positive and finite",
-		)
+	if value, exists := cfg["atrLength"]; exists {
+		atrLength, ok := value.(int)
+		if !ok {
+			return nil, fmt.Errorf("keltnerChannel: atrLength must be an integer")
+		}
+		config.ATRLength = atrLength
+	}
+
+	if value, exists := cfg["multiplier"]; exists {
+		switch v := value.(type) {
+		case int:
+			config.Multiplier = float64(v)
+		case float64:
+			config.Multiplier = v
+		default:
+			return nil, fmt.Errorf("keltnerChannel: multiplier must be numeric")
+		}
+	}
+
+	if value, exists := cfg["candleInterval"]; exists {
+		interval, ok := value.(string)
+		if !ok || interval == "" {
+			return nil, fmt.Errorf("keltnerChannel: invalid candleInterval")
+		}
+		config.CandleInterval = interval
+	}
+
+	if config.Length <= 0 {
+		return nil, fmt.Errorf("keltnerChannel: length must be positive")
+	}
+
+	if config.ATRLength <= 0 {
+		return nil, fmt.Errorf("keltnerChannel: atrLength must be positive")
+	}
+
+	if math.IsNaN(config.Multiplier) ||
+		math.IsInf(config.Multiplier, 0) ||
+		config.Multiplier <= 0 {
+		return nil, fmt.Errorf("keltnerChannel: multiplier must be positive and finite")
 	}
 
 	return &KeltnerChannel{
-		id:             id,
-		emaPeriod:      cfg.EMAPeriod,
-		atrPeriod:      cfg.ATRPeriod,
-		multiplier:     cfg.Multiplier,
-		candleInterval: cfg.CandleInterval,
+		id:  id,
+		cfg: config,
 	}, nil
 }
 
@@ -185,8 +198,8 @@ func (k *KeltnerChannel) Result() any {
 }
 
 func (k *KeltnerChannel) ingest(candle core.MarketCandle) {
-	
-	if !validKeltnerChannelCandle(candle, k.lastTimestamp) {
+	if !validKeltnerChannelCandle(candle, k.lastTime) {
+		k.result.IsReady = false
 		return
 	}
 
@@ -195,7 +208,7 @@ func (k *KeltnerChannel) ingest(candle core.MarketCandle) {
 	low := candle.GetLow()
 	closePrice := candle.GetClose()
 
-	// Calculate True Range.
+	// Step 1: Calculate True Range.
 	trueRange := high - low
 
 	if k.hasClose {
@@ -210,37 +223,37 @@ func (k *KeltnerChannel) ingest(candle core.MarketCandle) {
 
 	k.previousClose = closePrice
 	k.hasClose = true
-	k.lastTimestamp = timestamp
+	k.lastTime = timestamp
 
-	// EMA calculation with SMA seed.
-	if k.closeCount < k.emaPeriod {
+	// Step 2: EMA calculation with SMA seed.
+	if k.closeCount < k.cfg.Length {
 		k.closeSum += closePrice
 		k.closeCount++
 
-		if k.closeCount == k.emaPeriod {
-			k.ema = k.closeSum / float64(k.emaPeriod)
+		if k.closeCount == k.cfg.Length {
+			k.ema = k.closeSum / float64(k.cfg.Length)
 		}
 	} else {
-		alpha := 2.0 / float64(k.emaPeriod+1)
-
+		alpha := 2.0 / float64(k.cfg.Length+1)
 		k.ema = alpha*closePrice + (1-alpha)*k.ema
 	}
 
-	// ATR calculation with Wilder smoothing.
-	if k.trCount < k.atrPeriod {
+	// Step 3: ATR calculation with Wilder smoothing.
+	if k.trCount < k.cfg.ATRLength {
 		k.trSum += trueRange
 		k.trCount++
 
-		if k.trCount == k.atrPeriod {
-			k.atr = k.trSum / float64(k.atrPeriod)
+		if k.trCount == k.cfg.ATRLength {
+			k.atr = k.trSum / float64(k.cfg.ATRLength)
 		}
 	} else {
-		k.atr = (k.atr*float64(k.atrPeriod-1) + trueRange) / float64(k.atrPeriod)
+		k.atr = (k.atr*float64(k.cfg.ATRLength-1) + trueRange) /
+			float64(k.cfg.ATRLength)
 	}
 
-	// Both EMA and ATR must be ready.
-	if k.closeCount < k.emaPeriod ||
-		k.trCount < k.atrPeriod {
+	// Step 4: Wait until EMA and ATR are ready.
+	if k.closeCount < k.cfg.Length ||
+		k.trCount < k.cfg.ATRLength {
 		k.result = KeltnerChannelResult{
 			BaseResult: BaseResult{
 				IsReady:   false,
@@ -250,29 +263,27 @@ func (k *KeltnerChannel) ingest(candle core.MarketCandle) {
 		return
 	}
 
-	// Calculate Keltner Channel.
+	// Step 5: Calculate Keltner Channel.
 	middle := k.ema
-	upper := middle + k.multiplier*k.atr
-	lower := middle - k.multiplier*k.atr
+	upper := middle + k.cfg.Multiplier*k.atr
+	lower := middle - k.cfg.Multiplier*k.atr
 
-	// Reject non-finite calculation results.
-	for _, value := range []float64{
-		middle,
-		upper,
-		lower,
-	} {
+	// Step 6: Validate calculated values.
+	for _, value := range []float64{middle, upper, lower} {
 		if math.IsNaN(value) || math.IsInf(value, 0) {
+			k.result.IsReady = false
 			return
 		}
 	}
 
-	// Previous equals Current on first ready candle.
+	// Step 7: Previous ready Middle.
 	previous := middle
 
 	if k.hasResult {
 		previous = k.lastValue
 	}
 
+	// Step 8: Update result.
 	k.result = KeltnerChannelResult{
 		BaseResult: BaseResult{
 			IsReady:   true,
@@ -289,10 +300,7 @@ func (k *KeltnerChannel) ingest(candle core.MarketCandle) {
 	k.hasResult = true
 }
 
-// Own helper function for Keltner Channel.
-// No dependency on helpers from other indicator files.
-func validKeltnerChannelCandle(candle core.MarketCandle,lastTimestamp time.Time) bool {
-
+func validKeltnerChannelCandle(candle core.MarketCandle, lastTimestamp time.Time) bool {
 	if candle == nil {
 		return false
 	}
@@ -304,8 +312,7 @@ func validKeltnerChannelCandle(candle core.MarketCandle,lastTimestamp time.Time)
 	}
 
 	// Reject duplicate or out-of-order candles.
-	if !lastTimestamp.IsZero() &&
-		!timestamp.After(lastTimestamp) {
+	if !lastTimestamp.IsZero() && !timestamp.After(lastTimestamp) {
 		return false
 	}
 
@@ -314,12 +321,7 @@ func validKeltnerChannelCandle(candle core.MarketCandle,lastTimestamp time.Time)
 	low := candle.GetLow()
 	closePrice := candle.GetClose()
 
-	for _, value := range []float64{
-		open,
-		high,
-		low,
-		closePrice,
-	} {
+	for _, value := range []float64{open, high, low, closePrice} {
 		if math.IsNaN(value) ||
 			math.IsInf(value, 0) ||
 			value <= 0 {

@@ -2,9 +2,11 @@ package derivatives
 
 import (
 	"fmt"
-	"indicators/core"
 	"math"
 	"time"
+
+	"indicators/aggregate"
+	"indicators/core"
 )
 
 // describe: Short Covering
@@ -25,7 +27,7 @@ import (
 //	  },
 //	}
 //
-// ]
+// ],
 //
 // Available result:
 //
@@ -102,6 +104,7 @@ type ShortCoveringResult struct {
 type ShortCovering struct {
 	id             string
 	candleInterval string
+	aggregator     *aggregate.Aggregator
 
 	hasClose      bool
 	previousClose float64
@@ -115,19 +118,45 @@ type ShortCovering struct {
 	result ShortCoveringResult
 }
 
-func NewShortCovering(id string, cfg ShortCoveringConfig) (*ShortCovering, error) {
+func NewShortCovering(id string, cfg map[string]any) (*ShortCovering, error) {
 	if id == "" {
 		return nil, fmt.Errorf("ShortCovering name cannot be empty")
 	}
 
+	if cfg["candleInterval"] == nil {
+		return nil, fmt.Errorf("ShortCovering candleInterval is required")
+	}
+
+	interval, ok := cfg["candleInterval"].(string)
+	if !ok {
+		return nil, fmt.Errorf("ShortCovering candleInterval must be a string")
+	}
+
+	// agg, err := aggregate.NewAggregatorFromString(interval)
+	// if err != nil {
+	// 	return nil, fmt.Errorf("ShortCovering: %w", err)
+	// }
+
 	return &ShortCovering{
 		id:             id,
-		candleInterval: cfg.CandleInterval,
+		candleInterval: interval,
+		// aggregator:     agg,
 	}, nil
 }
 
 func (r *ShortCovering) Update(candle core.MarketCandle) any {
-	r.ingest(candle)
+	if candle == nil {
+		r.result.IsReady = false
+		return r.result
+	}
+
+	aggregated, ready := r.aggregator.Aggregate(candle)
+	if !ready {
+		r.result.IsReady = false
+		return r.result
+	}
+
+	r.ingest(aggregated)
 	return r.result
 }
 
@@ -190,13 +219,11 @@ func (r *ShortCovering) ingest(candle core.MarketCandle) {
 }
 
 func validShortCoveringCandle(candle core.MarketCandle, lastTimestamp time.Time) bool {
-
 	if candle == nil {
 		return false
 	}
 
 	timestamp := candle.GetTime()
-
 	if timestamp.IsZero() {
 		return false
 	}

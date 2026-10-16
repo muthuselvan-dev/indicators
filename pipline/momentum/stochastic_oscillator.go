@@ -60,13 +60,6 @@ import (
 // First complete K/D result is ready after
 // period + smoothK + smoothD - 2 valid candles.
 
-type StochasticOscillatorConfig struct {
-	Period         int
-	SmoothK        int
-	SmoothD        int
-	CandleInterval string
-}
-
 type StochasticOscillator struct {
 	id string
 
@@ -90,21 +83,38 @@ type StochasticOscillator struct {
 	result StochasticOscillatorResult
 }
 
-func NewStochasticOscillator(id string, cfg StochasticOscillatorConfig) (*StochasticOscillator, error) {
+func NewStochasticOscillator(id string, cfg map[string]any) (*StochasticOscillator, error) {
 	if id == "" {
 		return nil, fmt.Errorf("stochastic oscillator name cannot be empty")
 	}
 
-	if cfg.Period <= 0 || cfg.SmoothK <= 0 || cfg.SmoothD <= 0 {
+	period, ok := cfg["period"].(int)
+	if !ok || period <= 0 {
+		return nil, fmt.Errorf("stochastic oscillator period must be a positive integer")
+	}
+
+	smoothK, ok := cfg["smoothK"].(int)
+	if !ok || smoothK <= 0 {
+		return nil, fmt.Errorf("stochastic oscillator smoothK must be a positive integer")
+	}
+
+	smoothD, ok := cfg["smoothD"].(int)
+	if !ok || smoothD <= 0 {
+		return nil, fmt.Errorf("stochastic oscillator smoothD must be a positive integer")
+	}
+
+	// Validate candleInterval (non-empty string).
+	candleInterval, ok := cfg["candleInterval"].(string)
+	if !ok || candleInterval == "" {
 		return nil, fmt.Errorf("stochastic oscillator periods must be positive")
 	}
 
 	return &StochasticOscillator{
 		id:             id,
-		period:         cfg.Period,
-		smoothK:        cfg.SmoothK,
-		smoothD:        cfg.SmoothD,
-		candleInterval: cfg.CandleInterval,
+		period:         period,
+		smoothK:        smoothK,
+		smoothD:        smoothD,
+		candleInterval: candleInterval,
 	}, nil
 }
 

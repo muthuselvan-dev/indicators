@@ -9,209 +9,183 @@ import (
 
 // describe: Gap Strategy
 //
-// pipeConfigs: [
-//   {type: 'gapStrategy', name: 'gapStrategy', config: {period: 14, candleInterval: '1 minutes'}},
-// ]
+// QuantMan pipeConfig:
+// type: gapStrategy
+// name: gapStrategy
 //
-// Available result:
-//   - Current, Previous, IsReady, Timestamp
+// Standard gap calculation:
+//   GapPoints  = TodayOpen - PreviousDayClose
+//   GapPercent = GapPoints / PreviousDayClose * 100
 //
-// Entry Condition:
-//   Is Above threshold: Current > threshold
-//   Crosses Above threshold: Previous <= threshold && Current > threshold
+// Gap types (checked against QuantMan, BANKNIFTY 1 min, Aug 2025):
 //
-// Exit Condition:
-//   Is Below threshold: Current < threshold
-//   Crosses Below threshold: Previous >= threshold && Current < threshold
+//   FullGapUp      = TodayOpen >  PreviousDayHigh
+//   FullGapDown    = TodayOpen <  PreviousDayLow
+//   PartialGapUp   = TodayOpen >  PreviousDayClose && TodayOpen <= PreviousDayHigh
+//   PartialGapDown = TodayOpen <  PreviousDayClose && TodayOpen >= PreviousDayLow
 //
-// Original Formula / Explicit Interpretation:
-//   Gap = TodayFirstOpen - PreviousDayClose; Current is gap size.
+// Full gap up / down are verified against QuantMan trades.
+// Partial gap up / down use the usual definition and are NOT verified yet.
 //
-// Source: Standard OHLC arithmetic; QuantMan-specific semantics not verified.
-// Example config values are NOT claimed QuantMan defaults.
-// Warm-up: depends on period and prior-session availability.
+// GapUp   = GapPoints > 0
+// GapDown = GapPoints < 0
+//
+// Current  = GapPoints
+// Previous = Previous ready GapPoints
+//
+// All gap values stay fixed throughout the trading day.
+// The first trading day is only used for warm-up.
+//
+// IMPORTANT: this file defines GapStrategyResult.
+// Delete the old GapStrategyResult type from wherever it was declared.
 
-type GapStrategyConfig struct {
-	Period         int
-	Multiplier     float64
-	MaxBodyRatio   float64
-	CandleInterval string
-}
 type GapStrategy struct {
-	id               string
-	cfg              GapStrategyConfig
-	candles          []gapstrategySnapshotInternal
-	lastTime         time.Time
-	hasResult        bool
-	result           ScalarResult
-	sessionDay       string
-	sessionOpen      float64
-	sessionHigh      float64
-	sessionLow       float64
+	id string
+
+	sessionDay string
+	lastTime   time.Time
+
+	// Running values of the current session.
+	sessionHigh float64
+	sessionLow  float64
+	lastClose   float64
+	todayOpen   float64
+
+	// Values of the previous trading day.
 	previousDayClose float64
-	lastClose        float64
-	hasPreviousDay   bool
-}
-type GapStrategySnapshot struct {
-	Open, High, Low, Close float64
-	Timestamp              time.Time
-}
-type gapstrategySnapshotInternal struct {
-	open, high, low, close float64
-	timestamp              time.Time
+	previousDayHigh  float64
+	previousDayLow   float64
+
+	hasPreviousDay bool
+	hasResult      bool
+
+	result GapStrategyResult
 }
 
-func NewGapStrategy(id string, cfg GapStrategyConfig) (*GapStrategy, error) {
-	if id == "" || cfg.Period <= 0 {
-		return nil, fmt.Errorf("Gap Strategy: name and positive period required")
+func NewGapStrategy(id string, cfg map[string]any) (*GapStrategy, error) {
+	if id == "" {
+		return nil, fmt.Errorf("GapStrategy name cannot be empty")
 	}
-	if cfg.Multiplier < 0 || cfg.MaxBodyRatio < 0 {
-		return nil, fmt.Errorf("Gap Strategy: invalid multiplier/ratio")
-	}
-	return &GapStrategy{id: id, cfg: cfg}, nil
+
+	return &GapStrategy{
+		id: id,
+	}, nil
 }
-func (r *GapStrategy) Update(c core.MarketCandle) any { r.ingest(c); return r.result }
-func (r *GapStrategy) Result() any                    { return r.result }
-func (r *GapStrategy) ingest(c core.MarketCandle) {
-	if c == nil {
+
+func (r *GapStrategy) Update(candle core.MarketCandle) any {
+	r.ingest(candle)
+	return r.result
+}
+
+func (r *GapStrategy) Result() any {
+	return r.result
+}
+
+func (r *GapStrategy) ingest(candle core.MarketCandle) {
+	if candle == nil {
+		r.result.IsReady = false
 		return
 	}
-	t := c.GetTime()
-	o, h, l, cl := c.GetOpen(), c.GetHigh(), c.GetLow(), c.GetClose()
-	if t.IsZero() || (!r.lastTime.IsZero() && !t.After(r.lastTime)) || o <= 0 || h < l || h < math.Max(o, cl) || l > math.Min(o, cl) || math.IsNaN(cl) || math.IsInf(cl, 0) {
-		r.result = ScalarResult{Timestamp: t}
+
+	t := candle.GetTime()
+	o := candle.GetOpen()
+	h := candle.GetHigh()
+	l := candle.GetLow()
+	c := candle.GetClose()
+
+	if t.IsZero() ||
+		(!r.lastTime.IsZero() && !t.After(r.lastTime)) ||
+		!validGapOHLC(o, h, l, c) {
+		r.result.IsReady = false
 		return
 	}
-	r.lastTime = t
+
 	day := t.Format("2006-01-02")
-	newDay := day != r.sessionDay
-	if newDay {
+
+	if day != r.sessionDay {
+		// A new session starts: the finished session becomes "previous day".
 		if r.sessionDay != "" {
 			r.previousDayClose = r.lastClose
+			r.previousDayHigh = r.sessionHigh
+			r.previousDayLow = r.sessionLow
 			r.hasPreviousDay = true
 		}
+
 		r.sessionDay = day
-		r.sessionOpen = o
+		r.todayOpen = o
 		r.sessionHigh = h
 		r.sessionLow = l
 	} else {
 		if h > r.sessionHigh {
 			r.sessionHigh = h
 		}
+
 		if l < r.sessionLow {
 			r.sessionLow = l
 		}
 	}
-	r.lastClose = cl
-	s := gapstrategySnapshotInternal{open: o, high: h, low: l, close: cl, timestamp: t}
-	previous := gapstrategySnapshotInternal{}
-	hasPrevious := len(r.candles) > 0
-	if hasPrevious {
-		previous = r.candles[len(r.candles)-1]
-	}
-	r.candles = append(r.candles, s)
-	n := r.cfg.Period
-	if len(r.candles) > n+2 {
-		r.candles = r.candles[len(r.candles)-(n+2):]
-	}
-	current := 0.0
-	ready := false
-	switch "gap" {
-	case "previous":
-		if hasPrevious {
-			current = previous.close
-			ready = true
+
+	r.lastClose = c
+	r.lastTime = t
+
+	// First trading day is used for warmup.
+	if !r.hasPreviousDay {
+		r.result = GapStrategyResult{
+			IsReady:   false,
+			Timestamp: t,
 		}
-	case "indecision", "indecision_value":
-		if hasPrevious && previous.high > previous.low {
-			ratio := math.Abs(previous.close-previous.open) / (previous.high - previous.low)
-			if "gap" == "indecision_value" {
-				current = ratio
-			} else if ratio <= r.cfg.MaxBodyRatio {
-				current = 1
-			}
-			ready = true
-		}
-	case "at":
-		if len(r.candles) > n {
-			current = r.candles[len(r.candles)-1-n].close
-			ready = true
-		}
-	case "lastn":
-		if len(r.candles) >= n {
-			for _, x := range r.candles[len(r.candles)-n:] {
-				current += x.close
-			}
-			current /= float64(n)
-			ready = true
-		}
-	case "today":
-		current = cl
-		ready = true
-	case "prevday":
-		if r.hasPreviousDay {
-			current = r.previousDayClose
-			ready = true
-		}
-	case "gap":
-		if r.hasPreviousDay {
-			current = r.sessionOpen - r.previousDayClose
-			ready = true
-		}
-	case "orb":
-		if len(r.candles) >= n {
-			high := r.candles[len(r.candles)-n].high
-			for _, x := range r.candles[len(r.candles)-n:] {
-				if x.high > high {
-					high = x.high
-				}
-			}
-			current = cl - high
-			ready = true
-		}
-	case "range":
-		if len(r.candles) > n {
-			high := r.candles[len(r.candles)-1-n].high
-			for _, x := range r.candles[len(r.candles)-1-n : len(r.candles)-1] {
-				if x.high > high {
-					high = x.high
-				}
-			}
-			current = cl - high
-			ready = true
-		}
-	case "mrc":
-		if len(r.candles) >= n {
-			for _, x := range r.candles[len(r.candles)-n:] {
-				current += x.close
-			}
-			current /= float64(n)
-			ready = true
-		}
-	case "atrma":
-		if len(r.candles) >= n+1 {
-			for i := len(r.candles) - n; i < len(r.candles); i++ {
-				x, p := r.candles[i], r.candles[i-1]
-				tr := math.Max(x.high-x.low, math.Max(math.Abs(x.high-p.close), math.Abs(x.low-p.close)))
-				current += tr
-			}
-			current /= float64(n)
-			ready = true
-		}
-	case "rsima":
-		// RSI-of-RSI smoothing requires a separate RSI lookback; fail closed until configured.
-		ready = false
-	}
-	if !ready {
-		r.result = ScalarResult{Timestamp: t}
 		return
 	}
-	prev := current
+
+	gapPoints := r.todayOpen - r.previousDayClose
+	gapPercent := (gapPoints / r.previousDayClose) * 100
+
+	fullGapUp := r.todayOpen > r.previousDayHigh
+	fullGapDown := r.todayOpen < r.previousDayLow
+
+	partialGapUp := r.todayOpen > r.previousDayClose &&
+		r.todayOpen <= r.previousDayHigh
+
+	partialGapDown := r.todayOpen < r.previousDayClose &&
+		r.todayOpen >= r.previousDayLow
+
+	previous := gapPoints
+
 	if r.hasResult {
-		prev = r.result.Current
+		previous = r.result.Current
 	}
-	r.result = ScalarResult{IsReady: true, Current: current, Previous: prev, Timestamp: t}
+
+	r.result = GapStrategyResult{
+		IsReady:          true,
+		Current:          gapPoints,
+		Previous:         previous,
+		GapPoints:        gapPoints,
+		GapPercent:       gapPercent,
+		GapUp:            gapPoints > 0,
+		GapDown:          gapPoints < 0,
+		FullGapUp:        fullGapUp,
+		FullGapDown:      fullGapDown,
+		PartialGapUp:     partialGapUp,
+		PartialGapDown:   partialGapDown,
+		TodayOpen:        r.todayOpen,
+		PreviousDayClose: r.previousDayClose,
+		PreviousDayHigh:  r.previousDayHigh,
+		PreviousDayLow:   r.previousDayLow,
+		Timestamp:        t,
+	}
+
 	r.hasResult = true
 }
 
-var _ core.Indicator = (*GapStrategy)(nil)
+func validGapOHLC(o, h, l, c float64) bool {
+	for _, value := range []float64{o, h, l, c} {
+		if math.IsNaN(value) ||
+			math.IsInf(value, 0) ||
+			value <= 0 {
+			return false
+		}
+	}
+
+	return h >= math.Max(o, c) &&
+		l <= math.Min(o, c)
+}

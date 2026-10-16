@@ -7,114 +7,182 @@ import (
 	"time"
 )
 
-// describe: Weighted Moving Average
+// Indicator Name: Weighted Moving Average (WMA)
 //
-// pipeConfigs: [{type: 'wMA', name: 'wMA', config: {period: <user supplied>, candleInterval: <user supplied>}}]
+// Pipe Config:
+//   type: "weightedMovingAverage"
+//   name: "weightedMovingAverage"
+//   config:
+//     period: 9
+//     candleInterval: "1 minutes"
 //
-// Available result: Current, Previous, IsReady, Timestamp and indicator-specific fields in types.go.
-// Entry Condition: Example - Previous <= 0 && Current > 0 (where meaningful); strategy decides entry.
-// Exit Condition: Example - Previous >= 0 && Current < 0 (where meaningful); strategy decides exit.
-// Original Formula: Weighted Moving Average; see independent calculation in ingest.
-// Current is the latest value; Previous is the preceding ready value.
-// First ready value requires configured warm-up candles; see ingest.
+// Entry Condition (example):
+//   BUY when price crosses above WMA.
+//   PreviousClose <= PreviousWMA && CurrentClose > CurrentWMA
+//
+// Exit Condition (example):
+//   SELL when price crosses below WMA.
+//   PreviousClose >= PreviousWMA && CurrentClose < CurrentWMA
+//
+// Original Formula:
+//   WMA = Sum(Close[i] * Weight[i]) / Sum(Weight[i])
+//
+//   Weights = 1, 2, 3, ..., Period
+//   Oldest candle gets weight 1.
+//   Latest candle gets weight Period.
+//
+//   Denominator = Period * (Period + 1) / 2
+//
+// Result:
+//   Current, Previous, IsReady, Timestamp
+//
+// First ready value requires Period valid candles.
+
 type WMAConfig struct {
 	Period         int
 	CandleInterval string
 }
 
 type WMA struct {
-	id            string
-	cfg           WMAConfig
+	id  string
+	cfg WMAConfig
+
 	closes        []float64
-	highs         []float64
-	lows          []float64
 	lastTimestamp time.Time
-	seeded        bool
-	hasResult     bool
-	value         float64
-	upper         float64
-	lower         float64
-	direction     int
-	sar           float64
-	extreme       float64
-	accel         float64
-	result        WMAResult
+
+	hasResult bool
+	value     float64
+
+	result WMAResult
 }
 
-func NewWMA(id string, cfg WMAConfig) (*WMA, error) {
+func NewWMA(
+	id string,
+	cfg map[string]any,
+) (*WMA, error) {
 	if id == "" {
 		return nil, fmt.Errorf("indicator id is required")
 	}
-	if cfg.Period <= 0 {
-		return nil, fmt.Errorf("WMA: period must be positive")
+
+	config := WMAConfig{
+		Period:         9,
+		CandleInterval: "1 minutes",
 	}
-	return &WMA{id: id, cfg: cfg}, nil
+
+	if v, ok := cfg["period"]; ok {
+		period, valid := v.(int)
+		if !valid {
+			return nil, fmt.Errorf(
+				"WMA: period must be an integer",
+			)
+		}
+		config.Period = period
+	}
+
+	if v, ok := cfg["candleInterval"]; ok {
+		interval, valid := v.(string)
+		if !valid || interval == "" {
+			return nil, fmt.Errorf(
+				"WMA: candleInterval must be a non-empty string",
+			)
+		}
+		config.CandleInterval = interval
+	}
+
+	if config.Period <= 0 {
+		return nil, fmt.Errorf(
+			"WMA: period must be positive",
+		)
+	}
+
+	return &WMA{
+		id:     id,
+		cfg:    config,
+		closes: make([]float64, 0, config.Period),
+	}, nil
 }
-func (s *WMA) Update(candle core.MarketCandle) any { s.ingest(candle); return s.result }
-func (s *WMA) Result() any                         { return s.result }
+
+func (s *WMA) Update(candle core.MarketCandle) any {
+	s.ingest(candle)
+	return s.result
+}
+
+func (s *WMA) Result() any {
+	return s.result
+}
+
 func (s *WMA) ingest(candle core.MarketCandle) {
+	s.result.IsReady = false
+
 	if candle == nil {
 		return
 	}
-	timestamp, high, low, close := candle.GetTime(), candle.GetHigh(), candle.GetLow(), candle.GetClose()
-	if timestamp.IsZero() || (!s.lastTimestamp.IsZero() && !timestamp.After(s.lastTimestamp)) || math.IsNaN(high) || math.IsInf(high, 0) || math.IsNaN(low) || math.IsInf(low, 0) || math.IsNaN(close) || math.IsInf(close, 0) || low <= 0 || high < low || close <= 0 {
-		s.result.IsReady = false
+
+	timestamp := candle.GetTime()
+	high := candle.GetHigh()
+	low := candle.GetLow()
+	closePrice := candle.GetClose()
+
+	if timestamp.IsZero() ||
+		(!s.lastTimestamp.IsZero() &&
+			!timestamp.After(s.lastTimestamp)) ||
+		math.IsNaN(high) ||
+		math.IsInf(high, 0) ||
+		math.IsNaN(low) ||
+		math.IsInf(low, 0) ||
+		math.IsNaN(closePrice) ||
+		math.IsInf(closePrice, 0) ||
+		low <= 0 ||
+		high < low ||
+		closePrice <= 0 {
 		return
 	}
+
 	s.lastTimestamp = timestamp
-	s.closes = append(s.closes, close)
-	s.highs = append(s.highs, high)
-	s.lows = append(s.lows, low)
-	// Preserve a bounded window for memory efficiency while retaining sufficient warmup history.
-	cfg := s.cfg
-	maxHistory := max(500, 4*cfg.Period+10)
-	if len(s.closes) > maxHistory {
+	s.result.Timestamp = timestamp
+
+	s.closes = append(s.closes, closePrice)
+
+	period := s.cfg.Period
+
+	// Keep only the required period candles.
+	if len(s.closes) > period {
 		s.closes = s.closes[1:]
-		s.highs = s.highs[1:]
-		s.lows = s.lows[1:]
 	}
-	period := cfg.Period
-	closes, highs, lows := s.closes, s.highs, s.lows
-	if len(closes) < period {
-		s.result.IsReady = false
-		s.result.Timestamp = timestamp
+
+	// Warm-up.
+	if len(s.closes) < period {
 		return
 	}
-	_ = cfg
-	_ = high
-	_ = low
-	_ = highs
-	_ = lows
-	var current float64
-	current = s.weighted(closes[len(closes)-period:])
+
+	// Original Weighted Moving Average.
+	var weightedSum float64
+
+	for i, price := range s.closes {
+		weight := float64(i + 1)
+		weightedSum += price * weight
+	}
+
+	denominator := float64(period) *
+		float64(period+1) / 2.0
+
+	current := weightedSum / denominator
+
 	if math.IsNaN(current) || math.IsInf(current, 0) {
-		s.result.IsReady = false
 		return
 	}
+
 	previous := current
+
 	if s.hasResult {
 		previous = s.value
 	}
-	s.result.IsReady = true
+
 	s.result.Current = current
 	s.result.Previous = previous
+	s.result.IsReady = true
 	s.result.Timestamp = timestamp
+
 	s.value = current
 	s.hasResult = true
-}
-func (s *WMA) avg(values []float64) float64 {
-	var sum float64
-	for _, v := range values {
-		sum += v
-	}
-	return sum / float64(len(values))
-}
-func (s *WMA) weighted(values []float64) float64 {
-	var sum, den float64
-	for i, v := range values {
-		w := float64(i + 1)
-		sum += v * w
-		den += w
-	}
-	return sum / den
 }

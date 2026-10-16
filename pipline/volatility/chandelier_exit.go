@@ -7,79 +7,84 @@ import (
 	"time"
 )
 
-// describe: Chandelier Exit
+// Indicator Name: Chandelier Exit
 //
-// Chandelier Exit is an ATR-based trailing stop indicator.
+// Pipe Config:
 //
-// pipeConfigs: [
-//   {
-//     type: 'chandelierExit',
-//     name: 'chandelierExit',
-//     config: {
-//       period: 22,
-//       multiplier: 3,
-//       candleInterval: '1 minutes'
-//     }
-//   }
-// ]
+// {
+//     Type: "chandelierExit",
+//     Name: "chandelierExit",
+//     Config: map[string]any{
+//         "period":         22,
+//         "multiplier":     3.0,
+//         "useClosePrice":  true,
+//         "candleInterval": "1 minutes",
+//     },
+// }
 //
-// Available result:
-//   - Current: Long Exit
-//   - Previous: Previous ready Long Exit
-//   - IsReady
-//   - Timestamp
+// Entry Condition (QuantMan):
+//   Current Close Is Above Chandelier Exit Long Stop:
+//     Close > Current
 //
-// Entry Condition:
-//   Is Above: Current > threshold
-//   Crosses Above: Previous <= threshold && Current > threshold
+// Exit Condition (QuantMan):
+//   Current Close Is Below Chandelier Exit Long Stop:
+//     Close < Current
 //
-// Exit Condition:
-//   Is Below: Current < threshold
-//   Crosses Below: Previous >= threshold && Current < threshold
+// Formula:
 //
-// Original Formula:
-//
-//   True Range = max(
-//     High - Low,
-//     abs(High - PreviousClose),
-//     abs(Low - PreviousClose)
+//   TrueRange = Max(
+//       High - Low,
+//       Abs(High - PreviousClose),
+//       Abs(Low - PreviousClose)
 //   )
 //
-//   ATR Seed = Sum(first Period true ranges) / Period
+//   FirstATR = Sum(First Period TrueRanges) / Period
 //
-//   Wilder ATR =
-//     (PreviousATR * (Period - 1) + CurrentTR) / Period
+//   NextATR =
+//       (PreviousATR * (Period - 1) + TrueRange) / Period
 //
-//   Long Exit = HighestHigh(Period) - Multiplier * ATR
+//   If UseClosePrice = true:
+//       HighestValue = HighestClose(Period)
+//   If UseClosePrice = false:
+//       HighestValue = HighestHigh(Period)
 //
-//   Short Exit = LowestLow(Period) + Multiplier * ATR
+//   RawLongStop = HighestValue - Multiplier * ATR
+//
+//   Long Stop (ratchet):
+//       If PreviousClose > PreviousLongStop:
+//           LongStop = Max(RawLongStop, PreviousLongStop)
+//       Else:
+//           LongStop = RawLongStop
+//
+//   The ratchet means the Long Stop never moves down while price stays
+//   above it. Verified: 13/13 QuantMan trades match (BANKNIFTY 1 minute,
+//   2025-08-08 to 2025-08-28, Is Above / Is Below the Long Stop).
 //
 // Result:
-//   Current and Previous expose the Long Exit only.
-//   Short Exit is not exposed by ScalarResult.
+//   ScalarResult:
+//     Current  = LongStop
+//     Previous = Previous ready LongStop
+//     IsReady
+//     Timestamp
 //
 // Warmup:
-//   The first candle establishes PreviousClose.
-//   The next Period candles seed ATR.
+//   First candle establishes PreviousClose.
+//   Next Period candles initialize ATR.
 //   First ready result requires Period + 1 valid candles.
 //
-// Reference:
-// https://chartschool.stockcharts.com/table-of-contents/technical-indicators-and-overlays/technical-overlays/chandelier-exit
-//
 // Note:
-// QuantMan exact parity is not verified.
+//   The Short Stop is not exposed by ScalarResult.
 
 type ChandelierExitConfig struct {
 	Period         int
 	Multiplier     float64
+	UseClosePrice  bool
 	CandleInterval string
 }
 
 type ChandelierExit struct {
-	id             string
-	period         int
-	multiplier     float64
-	candleInterval string
+	id  string
+	cfg ChandelierExitConfig
 
 	highs []float64
 	lows  []float64
@@ -93,30 +98,75 @@ type ChandelierExit struct {
 
 	lastTime time.Time
 
+	// Previous ready (ratcheted) Long Stop.
 	hasResult bool
-	result    ScalarResult
+	lastValue float64
+
+	result ScalarResult
 }
 
-func NewChandelierExit(id string, cfg ChandelierExitConfig) (*ChandelierExit, error) {
+func NewChandelierExit(id string, cfg map[string]any) (*ChandelierExit, error) {
 	if id == "" {
-		return nil, fmt.Errorf("Chandelier Exit name cannot be empty")
+		return nil, fmt.Errorf("chandelierExit: indicator id is required")
 	}
 
-	if cfg.Period < 1 {
-		return nil, fmt.Errorf("Chandelier Exit period must be greater than zero")
+	config := ChandelierExitConfig{
+		Period:         22,
+		Multiplier:     3.0,
+		UseClosePrice:  true,
+		CandleInterval: "1 minutes",
 	}
 
-	if cfg.Multiplier <= 0 ||
-		math.IsNaN(cfg.Multiplier) ||
-		math.IsInf(cfg.Multiplier, 0) {
-		return nil, fmt.Errorf("Chandelier Exit multiplier must be finite and greater than zero")
+	if value, exists := cfg["period"]; exists {
+		period, ok := value.(int)
+		if !ok {
+			return nil, fmt.Errorf("chandelierExit: period must be an integer")
+		}
+		config.Period = period
+	}
+
+	if value, exists := cfg["multiplier"]; exists {
+		switch v := value.(type) {
+		case int:
+			config.Multiplier = float64(v)
+		case float64:
+			config.Multiplier = v
+		default:
+			return nil, fmt.Errorf("chandelierExit: multiplier must be numeric")
+		}
+	}
+
+	if value, exists := cfg["useClosePrice"]; exists {
+		useClosePrice, ok := value.(bool)
+		if !ok {
+			return nil, fmt.Errorf("chandelierExit: useClosePrice must be boolean")
+		}
+		config.UseClosePrice = useClosePrice
+	}
+
+	if value, exists := cfg["candleInterval"]; exists {
+		interval, ok := value.(string)
+		if !ok || interval == "" {
+			return nil, fmt.Errorf("chandelierExit: invalid candleInterval")
+		}
+		config.CandleInterval = interval
+	}
+
+	if config.Period <= 0 {
+		return nil, fmt.Errorf("chandelierExit: period must be positive")
+	}
+
+	if math.IsNaN(config.Multiplier) ||
+		math.IsInf(config.Multiplier, 0) ||
+		config.Multiplier <= 0 {
+		return nil, fmt.Errorf("chandelierExit: multiplier must be positive and finite")
 	}
 
 	return &ChandelierExit{
-		id:             id,
-		period:         cfg.Period,
-		multiplier:     cfg.Multiplier,
-		candleInterval: cfg.CandleInterval,
+		id:    id,
+		cfg:   config,
+		highs: make([]float64, 0, config.Period),
+		lows:  make([]float64, 0, config.Period),
 	}, nil
 }
 
@@ -131,6 +181,7 @@ func (r *ChandelierExit) Result() any {
 
 func (r *ChandelierExit) ingest(candle core.MarketCandle) {
 	if !validChandelierExitCandle(candle, r.lastTime) {
+		r.result.IsReady = false
 		return
 	}
 
@@ -139,15 +190,22 @@ func (r *ChandelierExit) ingest(candle core.MarketCandle) {
 	low := candle.GetLow()
 	closePrice := candle.GetClose()
 
-	// First candle establishes previous close.
-	// No True Range is accumulated yet.
+	highestSource := high
+	lowestSource := low
+
+	if r.cfg.UseClosePrice {
+		highestSource = closePrice
+		lowestSource = closePrice
+	}
+
+	// First candle establishes PreviousClose.
 	if !r.hasClose {
 		r.lastClose = closePrice
 		r.hasClose = true
 		r.lastTime = timestamp
 
-		r.highs = append(r.highs, high)
-		r.lows = append(r.lows, low)
+		r.highs = append(r.highs, highestSource)
+		r.lows = append(r.lows, lowestSource)
 
 		r.result = ScalarResult{
 			IsReady:   false,
@@ -156,43 +214,43 @@ func (r *ChandelierExit) ingest(candle core.MarketCandle) {
 		return
 	}
 
-	// Calculate True Range using previous close.
+	// Step 1: True Range (uses the previous close).
+	previousClose := r.lastClose
+
 	trueRange := math.Max(
 		high-low,
 		math.Max(
-			math.Abs(high-r.lastClose),
-			math.Abs(low-r.lastClose),
+			math.Abs(high-previousClose),
+			math.Abs(low-previousClose),
 		),
 	)
 
 	r.lastClose = closePrice
 	r.lastTime = timestamp
 
-	// Maintain rolling highs and lows.
-	r.highs = append(r.highs, high)
-	r.lows = append(r.lows, low)
+	// Step 2: Maintain rolling price sources.
+	r.highs = append(r.highs, highestSource)
+	r.lows = append(r.lows, lowestSource)
 
-	if len(r.highs) > r.period {
+	if len(r.highs) > r.cfg.Period {
 		r.highs = r.highs[1:]
 		r.lows = r.lows[1:]
 	}
 
-	// Seed ATR using the first Period true ranges.
-	if r.trCount < r.period {
+	// Step 3: ATR initialization and Wilder smoothing.
+	if r.trCount < r.cfg.Period {
 		r.trSum += trueRange
 		r.trCount++
 
-		if r.trCount == r.period {
-			r.atr = r.trSum / float64(r.period)
+		if r.trCount == r.cfg.Period {
+			r.atr = r.trSum / float64(r.cfg.Period)
 		}
 	} else {
-		// Wilder smoothing.
-		r.atr = (r.atr*float64(r.period-1) + trueRange) / float64(r.period)
+		r.atr = (r.atr*float64(r.cfg.Period-1) + trueRange) / float64(r.cfg.Period)
 	}
 
-	// Wait until ATR and rolling highs are ready.
-	if r.trCount < r.period ||
-		len(r.highs) < r.period {
+	// Wait for ATR and rolling price window.
+	if r.trCount < r.cfg.Period || len(r.highs) < r.cfg.Period {
 		r.result = ScalarResult{
 			IsReady:   false,
 			Timestamp: timestamp,
@@ -200,41 +258,46 @@ func (r *ChandelierExit) ingest(candle core.MarketCandle) {
 		return
 	}
 
-	highestHigh := r.highs[0]
+	// Step 4: Highest value over the window.
+	highestValue := r.highs[0]
 
-	for _, value := range r.highs[1:] {
-		if value > highestHigh {
-			highestHigh = value
+	for i := 1; i < len(r.highs); i++ {
+		if r.highs[i] > highestValue {
+			highestValue = r.highs[i]
 		}
 	}
 
-	// Chandelier Long Exit.
-	current := highestHigh - r.multiplier*r.atr
+	// Step 5: Long Stop with ratchet.
+	longStop := highestValue - r.cfg.Multiplier*r.atr
 
-	if math.IsNaN(current) || math.IsInf(current, 0) {
+	if math.IsNaN(longStop) || math.IsInf(longStop, 0) {
+		r.result.IsReady = false
 		return
 	}
 
-	previous := current
+	// The Long Stop never moves down while the previous close was above it.
+	if r.hasResult && previousClose > r.lastValue {
+		longStop = math.Max(longStop, r.lastValue)
+	}
+
+	previous := longStop
 
 	if r.hasResult {
-		previous = r.result.Current
+		previous = r.lastValue
 	}
 
 	r.result = ScalarResult{
 		IsReady:   true,
-		Current:   current,
+		Current:   longStop,
 		Previous:  previous,
 		Timestamp: timestamp,
 	}
 
+	r.lastValue = longStop
 	r.hasResult = true
 }
 
-// Own validation helper for Chandelier Exit.
-
 func validChandelierExitCandle(candle core.MarketCandle, lastTimestamp time.Time) bool {
-
 	if candle == nil {
 		return false
 	}
@@ -245,8 +308,7 @@ func validChandelierExitCandle(candle core.MarketCandle, lastTimestamp time.Time
 		return false
 	}
 
-	if !lastTimestamp.IsZero() &&
-		!timestamp.After(lastTimestamp) {
+	if !lastTimestamp.IsZero() && !timestamp.After(lastTimestamp) {
 		return false
 	}
 
@@ -255,17 +317,8 @@ func validChandelierExitCandle(candle core.MarketCandle, lastTimestamp time.Time
 	low := candle.GetLow()
 	closePrice := candle.GetClose()
 
-	values := []float64{
-		open,
-		high,
-		low,
-		closePrice,
-	}
-
-	for _, value := range values {
-		if math.IsNaN(value) ||
-			math.IsInf(value, 0) ||
-			value <= 0 {
+	for _, value := range []float64{open, high, low, closePrice} {
+		if math.IsNaN(value) || math.IsInf(value, 0) || value <= 0 {
 			return false
 		}
 	}

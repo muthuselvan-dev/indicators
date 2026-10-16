@@ -2,6 +2,7 @@ package momentum
 
 import (
 	"fmt"
+
 	"indicators/core"
 	"math"
 	"time"
@@ -65,13 +66,9 @@ import (
 // With period 14, the first RSI is ready
 // after 15 valid closing prices.
 
-type RSIConfig struct {
-	Period         int
-	CandleInterval string
-}
-
 type RSI struct {
 	id string
+	// aggregator *aggregate.Aggregator
 
 	period         int
 	candleInterval string
@@ -94,26 +91,48 @@ type RSI struct {
 	result RSIResult
 }
 
-func NewRSI(id string, cfg RSIConfig) (*RSI, error) {
+func NewRSI(id string, cfg map[string]interface{}) (*RSI, error) {
 	if id == "" {
 		return nil, fmt.Errorf("RSI name cannot be empty")
 	}
 
-	if cfg.Period <= 0 {
-		return nil, fmt.Errorf(
-			"RSI period must be positive: %d",
-			cfg.Period,
-		)
+	period := 14
+
+	if value, exists := cfg["period"]; exists {
+		if p, ok := value.(int); ok {
+			period = p
+		} else if p, ok := value.(float64); ok {
+			period = int(p)
+		}
 	}
+
+	candleInterval, _ := cfg["candleInterval"].(string)
+
+	var minutes int
+
+	_, err := fmt.Sscanf(candleInterval, "%d minutes", &minutes)
+	if err != nil || minutes <= 0 {
+		return nil, fmt.Errorf("invalid candleInterval: %s", candleInterval)
+	}
+
+	// agg := aggregate.NewAggregator(minutes)
 
 	return &RSI{
 		id:             id,
-		period:         cfg.Period,
-		candleInterval: cfg.CandleInterval,
+		period:         period,
+		candleInterval: candleInterval,
+		// aggregator:     agg,
 	}, nil
 }
 
 func (r *RSI) Update(candle core.MarketCandle) any {
+
+	// aggregated, ready := r.aggregator.Aggregate(candle)
+
+	// if !ready {
+	// 	return r.result
+	// }
+
 	r.ingest(candle)
 	return r.result
 }

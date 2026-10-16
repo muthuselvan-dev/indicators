@@ -73,13 +73,6 @@ import (
 // All periods are configurable.
 // EMA calculations are independent within this indicator.
 
-type MACDConfig struct {
-	FastPeriod     int
-	SlowPeriod     int
-	SignalPeriod   int
-	CandleInterval string
-}
-
 type MACD struct {
 	id string
 
@@ -111,25 +104,40 @@ type MACD struct {
 	result MACDResult
 }
 
-func NewMACD(id string, cfg MACDConfig) (*MACD, error) {
+func NewMACD(id string, cfg map[string]any) (*MACD, error) {
+	fastPeriod, ok := cfg["fastPeriod"].(int)
+	if !ok {
+		return nil, fmt.Errorf("MACD fastPeriod must be an int")
+	}
+
+	slowPeriod, ok := cfg["slowPeriod"].(int)
+	if !ok {
+		return nil, fmt.Errorf("MACD slowPeriod must be an int")
+	}
+
+	signalPeriod, ok := cfg["signalPeriod"].(int)
+	if !ok {
+		return nil, fmt.Errorf("MACD signalPeriod must be an int")
+	}
+
 	if id == "" {
 		return nil, fmt.Errorf("MACD name cannot be empty")
 	}
 
-	if cfg.FastPeriod <= 0 || cfg.SlowPeriod <= 0 || cfg.SignalPeriod <= 0 {
+	if fastPeriod <= 0 || slowPeriod <= 0 || signalPeriod <= 0 {
 		return nil, fmt.Errorf("MACD periods must be positive")
 	}
 
-	if cfg.FastPeriod >= cfg.SlowPeriod {
+	if fastPeriod >= slowPeriod {
 		return nil, fmt.Errorf("MACD fastPeriod must be smaller than slowPeriod")
 	}
 
 	return &MACD{
 		id:             id,
-		fastPeriod:     cfg.FastPeriod,
-		slowPeriod:     cfg.SlowPeriod,
-		signalPeriod:   cfg.SignalPeriod,
-		candleInterval: cfg.CandleInterval,
+		fastPeriod:     fastPeriod,
+		slowPeriod:     slowPeriod,
+		signalPeriod:   signalPeriod,
+		candleInterval: cfg["candleInterval"].(string),
 	}, nil
 }
 

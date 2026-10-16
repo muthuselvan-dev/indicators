@@ -55,11 +55,6 @@ import (
 // Invalid or duplicate candles are rejected without
 // changing the last calculated result.
 
-type MFIConfig struct {
-	Period         int
-	CandleInterval string
-}
-
 type MFI struct {
 	id string
 
@@ -80,24 +75,18 @@ type MFI struct {
 	result MFIResult
 }
 
-func NewMFI(id string, cfg MFIConfig) (*MFI, error) {
+func NewMFI(id string, cfg map[string]any) (*MFI, error) {
+
 	if id == "" {
 		return nil, fmt.Errorf("MFI name cannot be empty")
 	}
 
-	// Safety invariant. Central configuration may provide
-	// defaults, but an invalid period must never reach
-	// allocation or calculation.
-	if cfg.Period <= 0 {
-		return nil, fmt.Errorf("MFI period must be positive: %d", cfg.Period)
-	}
-
 	return &MFI{
 		id:             id,
-		period:         cfg.Period,
-		candleInterval: cfg.CandleInterval,
-		posFlows:       make([]float64, 0, cfg.Period),
-		negFlows:       make([]float64, 0, cfg.Period),
+		period:         cfg["period"].(int),
+		candleInterval: cfg["candleInterval"].(string),
+		posFlows:       make([]float64, 0, cfg["period"].(int)),
+		negFlows:       make([]float64, 0, cfg["period"].(int)),
 	}, nil
 }
 

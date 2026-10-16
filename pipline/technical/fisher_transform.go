@@ -7,93 +7,269 @@ import (
 	"time"
 )
 
-// describe: Fisher Transform
+// Indicator Name: Fisher Transform
 //
-// pipeConfigs: [
-//   {type: 'fisherTransform', name: 'fisherTransform', config: {period: 10, candleInterval: '1 minutes'}},
-// ]
+// QuantMan Pipe Config:
 //
-// Available result: Current, Previous, IsReady, Timestamp.
-// Entry Condition: Is Above threshold: Current > threshold;
-//                  Crosses Above threshold: Previous <= threshold && Current > threshold.
-// Exit Condition: Is Below threshold: Current < threshold;
-//                 Crosses Below threshold: Previous >= threshold && Current < threshold.
+// {
+//     Type: "fisherTransform",
+//     Name: "ft",
+//     Config: map[string]any{
+//         "noOfCandles":    9,
+//         "candleInterval": "1 minutes",
+//     },
+// }
 //
 // Original Formula:
-// Median Price = (High + Low)/2.
-// Normalize median in rolling period range to [-1,1].
-// X = 0.33*2*((Median-Lowest)/(Highest-Lowest)-0.5) + 0.67*previousX.
-// Fisher = 0.5*ln((1+X)/(1-X)) + 0.5*previousFisher.
 //
-// Source: https://www.tradingview.com/support/solutions/43000589141-fisher-transform/
-// The examples are strategy rules, not guaranteed QuantMan defaults.
-// Warm-up: period candles.
+//   MedianPrice = (High + Low) / 2
+//
+//   Highest = Highest(MedianPrice, Period)
+//   Lowest  = Lowest(MedianPrice, Period)
+//
+//   Normalized = 2 * (
+//       (MedianPrice - Lowest) / (Highest - Lowest) - 0.5
+//   )
+//
+//   X = 0.33 * Normalized + 0.67 * PreviousX
+//
+//   X = Max(-0.999, Min(0.999, X))
+//
+//   Fisher = 0.5 * Ln((1 + X) / (1 - X)) +
+//            0.5 * PreviousFisher
+//
+// Entry Condition:
+//
+//   Current Is Above Threshold:
+//     Current > Threshold
+//
+//   Current Crosses Above Threshold:
+//     Previous <= Threshold && Current > Threshold
+//
+// Exit Condition:
+//
+//   Current Is Below Threshold:
+//     Current < Threshold
+//
+//   Current Crosses Below Threshold:
+//     Previous >= Threshold && Current < Threshold
+//
+// Result:
+//
+//   ScalarResult:
+//     Current  = Latest Fisher Transform value
+//     Previous = Previous ready Fisher Transform value
+//     IsReady
+//     Timestamp
+//
+// Warmup:
+//   First ready result requires Period valid candles.
+//
+// Important:
+//   External QuantMan key: noOfCandles
+//   Internal Go field: Period
+//
+//   When Highest == Lowest, Normalized = 0.
+//   Recursive X and Fisher states start at zero.
+//
+// Tested vs QuantMan (Is Above / Is Below 0, BANKNIFTY 1 min,
+// 08 Aug to 28 Aug 2025): 10/13 trades match. The 3 mismatches
+// are exits where Fisher is within ~0.02 of the threshold.
 
 type FisherTransformConfig struct {
 	Period         int
 	CandleInterval string
 }
+
 type FisherTransform struct {
-	id             string
-	period         int
-	candleInterval string
-	prices         []float64
-	x              float64
-	fisher         float64
-	lastTime       time.Time
-	hasResult      bool
-	result         ScalarResult
+	id  string
+	cfg FisherTransformConfig
+
+	prices []float64
+
+	x      float64
+	fisher float64
+
+	lastTime time.Time
+
+	hasResult bool
+	lastValue float64
+
+	result ScalarResult
 }
 
-func NewFisherTransform(id string, cfg FisherTransformConfig) (*FisherTransform, error) {
-	if id == "" || cfg.Period < 2 {
-		return nil, fmt.Errorf("invalid Fisher Transform config")
+func NewFisherTransform(id string, cfg map[string]any) (*FisherTransform, error) {
+	if id == "" {
+		return nil, fmt.Errorf("fisherTransform: indicator id is required")
 	}
-	return &FisherTransform{id: id, period: cfg.Period, candleInterval: cfg.CandleInterval}, nil
+
+	config := FisherTransformConfig{
+		Period:         9,
+		CandleInterval: "1 minutes",
+	}
+
+	if value, exists := cfg["period"]; exists {
+		period, ok := value.(int)
+		if !ok {
+			return nil, fmt.Errorf("fisherTransform: period must be an integer")
+		}
+		config.Period = period
+	}
+
+	if value, exists := cfg["candleInterval"]; exists {
+		interval, ok := value.(string)
+		if !ok || interval == "" {
+			return nil, fmt.Errorf("fisherTransform: invalid candleInterval")
+		}
+		config.CandleInterval = interval
+	}
+
+	if config.Period < 2 {
+		return nil, fmt.Errorf("fisherTransform: period must be at least 2")
+	}
+
+	return &FisherTransform{
+		id:     id,
+		cfg:    config,
+		prices: make([]float64, 0, config.Period),
+	}, nil
 }
-func (r *FisherTransform) Update(c core.MarketCandle) any { r.ingest(c); return r.result }
-func (r *FisherTransform) Result() any                    { return r.result }
-func (r *FisherTransform) ingest(c core.MarketCandle) {
-	if c == nil {
+
+func (r *FisherTransform) Update(candle core.MarketCandle) any {
+	r.ingest(candle)
+	return r.result
+}
+
+func (r *FisherTransform) Result() any {
+	return r.result
+}
+
+func (r *FisherTransform) ingest(candle core.MarketCandle) {
+	if !validFisherTransformCandle(candle, r.lastTime) {
+		r.result.IsReady = false
 		return
 	}
-	t := c.GetTime()
-	h, l := c.GetHigh(), c.GetLow()
-	if t.IsZero() || (!r.lastTime.IsZero() && !t.After(r.lastTime)) || math.IsNaN(h) || math.IsNaN(l) || math.IsInf(h, 0) || math.IsInf(l, 0) || h < l || l <= 0 {
-		r.result = ScalarResult{Timestamp: t}
-		return
-	}
-	r.lastTime = t
-	r.prices = append(r.prices, (h+l)/2)
-	if len(r.prices) > r.period {
+
+	timestamp := candle.GetTime()
+	high := candle.GetHigh()
+	low := candle.GetLow()
+
+	r.lastTime = timestamp
+
+	// Step 1: Calculate Median Price.
+	medianPrice := (high + low) / 2
+
+	// Step 2: Maintain rolling Median Prices.
+	r.prices = append(r.prices, medianPrice)
+
+	if len(r.prices) > r.cfg.Period {
 		r.prices = r.prices[1:]
 	}
-	if len(r.prices) < r.period {
-		r.result = ScalarResult{Timestamp: t}
+
+	// Step 3: Wait for required candles.
+	if len(r.prices) < r.cfg.Period {
+		r.result = ScalarResult{
+			IsReady:   false,
+			Timestamp: timestamp,
+		}
 		return
 	}
-	lo, hi := r.prices[0], r.prices[0]
-	for _, v := range r.prices[1:] {
-		if v < lo {
-			lo = v
-		}
-		if v > hi {
-			hi = v
-		}
+
+	// Step 4: Find Highest and Lowest Median Prices.
+	highest := r.prices[0]
+	lowest := r.prices[0]
+
+	for i := 1; i < len(r.prices); i++ {
+		highest = math.Max(highest, r.prices[i])
+		lowest = math.Min(lowest, r.prices[i])
 	}
+
+	// Step 5: Normalize current Median Price.
 	normalized := 0.0
-	if hi > lo {
-		normalized = 2 * ((r.prices[len(r.prices)-1]-lo)/(hi-lo) - 0.5)
+
+	if highest > lowest {
+		normalized = 2 * ((medianPrice-lowest)/(highest-lowest) - 0.5)
 	}
+
+	// Step 6: Apply recursive smoothing.
 	x := 0.33*normalized + 0.67*r.x
+
+	// Step 7: Clamp X to avoid logarithm singularity.
 	x = math.Max(-0.999, math.Min(0.999, x))
-	f := 0.5*math.Log((1+x)/(1-x)) + 0.5*r.fisher
-	p := f
-	if r.hasResult {
-		p = r.result.Current
+
+	// Step 8: Calculate Fisher Transform.
+	fisher := 0.5*math.Log((1+x)/(1-x)) +
+		0.5*r.fisher
+
+	// Step 9: Reject non-finite result.
+	if math.IsNaN(fisher) || math.IsInf(fisher, 0) {
+		r.result.IsReady = false
+		return
 	}
+
+	// Step 10: Previous ready Fisher value.
+	previous := fisher
+
+	if r.hasResult {
+		previous = r.lastValue
+	}
+
+	// Step 11: Update result.
+	r.result = ScalarResult{
+		IsReady:   true,
+		Current:   fisher,
+		Previous:  previous,
+		Timestamp: timestamp,
+	}
+
+	// Step 12: Store recursive state.
 	r.x = x
-	r.fisher = f
-	r.result = ScalarResult{IsReady: true, Current: f, Previous: p, Timestamp: t}
+	r.fisher = fisher
+
+	r.lastValue = fisher
 	r.hasResult = true
+}
+
+func validFisherTransformCandle(candle core.MarketCandle, lastTimestamp time.Time) bool {
+	if candle == nil {
+		return false
+	}
+
+	timestamp := candle.GetTime()
+
+	if timestamp.IsZero() {
+		return false
+	}
+
+	// Reject duplicate or out-of-order candles.
+	if !lastTimestamp.IsZero() && !timestamp.After(lastTimestamp) {
+		return false
+	}
+
+	open := candle.GetOpen()
+	high := candle.GetHigh()
+	low := candle.GetLow()
+	closePrice := candle.GetClose()
+
+	for _, value := range []float64{open, high, low, closePrice} {
+		if math.IsNaN(value) ||
+			math.IsInf(value, 0) ||
+			value <= 0 {
+			return false
+		}
+	}
+
+	if high < low {
+		return false
+	}
+
+	if high < math.Max(open, closePrice) {
+		return false
+	}
+
+	if low > math.Min(open, closePrice) {
+		return false
+	}
+
+	return true
 }

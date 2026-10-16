@@ -1,6 +1,7 @@
 package candlestick
 
 import (
+	"indicators/aggregate"
 	"indicators/core"
 	"math"
 	"time"
@@ -13,6 +14,23 @@ type PatternResult struct {
 	Timestamp time.Time
 }
 type patternCandle struct{ open, high, low, close float64 }
+
+// DojiConfig holds Doji indicator configuration.
+type DojiConfig struct {
+	CandleInterval string
+	Tolerance      float64
+}
+
+// Doji holds the indicator calculation state.
+type Doji struct {
+	id             string
+	tolerance      float64
+	candleInterval string
+	aggregator     *aggregate.Aggregator
+	lastTimestamp  time.Time
+	hasResult      bool
+	result         PatternResult
+}
 
 func (c patternCandle) bull() bool          { return c.close > c.open }
 func (c patternCandle) bear() bool          { return c.close < c.open }

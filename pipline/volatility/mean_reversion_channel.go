@@ -7,111 +7,120 @@ import (
 	"time"
 )
 
-// describe: MRC (Mean Reversion Channel)
+// Indicator Name: Mean Reversion Channel (MRC)
 //
-// This implementation uses a rolling Simple Moving Average
-// with population-standard-deviation channel bands.
+// QuantMan Pipe Config:
 //
-// pipeConfigs: [
+// {
+//     Type: "meanReversionChannel",
+//     Name: "mrc",
+//     Config: map[string]any{
+//         "period":          200,
+//         "innerMultiplier": 1.0,
+//         "outerMultiplier": 2.415,
+//         "filterType":      "superSmoother",
+//         "candleInterval":  "1 minutes",
+//     },
+// }
 //
-//	{
-//	  type: 'meanReversionChannel',
-//	  name: 'meanReversionChannel',
-//	  config: {
-//	    period: 14,
-//	    multiplier: 2,
-//	    candleInterval: '1 minutes'
-//	  }
-//	}
+// Filter Type Options:
 //
-// ]
+//   superSmoother - Ehlers Super Smoother
+//   ehlersEma     - Ehlers EMA
+//   gaussian      - Gaussian Filter
+//   butterWorth   - Butterworth Filter
+//   bandStop      - Band Stop Filter
+//   sma           - Simple Moving Average
+//   ema           - Exponential Moving Average
+//   rma           - Wilder Moving Average
 //
-// Available result:
+// Implemented Filter:
+//   superSmoother only.
 //
-//   - Current (Middle)
-//   - Previous (Previous ready Middle)
-//   - Middle
-//   - Upper
-//   - Lower
-//   - StandardDeviation
-//   - IsReady
-//   - Timestamp
+// Reference Calculation:
 //
-// Entry Condition:
+//   Middle = TwoPoleSuperSmoother(Close, Period)
 //
-//   Close Is Below Lower:
-//     Close < Lower
+//   TrueRange = Max(
+//       High - Low,
+//       Abs(High - PreviousClose),
+//       Abs(Low - PreviousClose)
+//   )
 //
-//   Close Crosses Below Lower:
-//     PreviousClose >= PreviousLower && Close < Lower
+//   Width = TwoPoleSuperSmoother(TrueRange, Period)
 //
-// Exit Condition:
+//   InnerUpper = Middle + InnerMultiplier * Width
+//   InnerLower = Middle - InnerMultiplier * Width
 //
-//   Close Is Above Upper:
-//     Close > Upper
+//   OuterUpper = Middle + OuterMultiplier * Width
+//   OuterLower = Middle - OuterMultiplier * Width
 //
-//   Close Crosses Above Upper:
-//     PreviousClose <= PreviousUpper && Close > Upper
+// Result:
 //
-// Original Formula / Explicit Interpretation:
+//   BaseResult:
+//     Current  = Middle
+//     Previous = Previous ready Middle
+//     IsReady
+//     Timestamp
 //
-//   Middle = Sum(Close, Period) / Period
-//
-//   Variance = Sum((Close - Middle)^2) / Period
-//
-//   StandardDeviation = Sqrt(Variance)
-//
-//   Upper = Middle + Multiplier * StandardDeviation
-//
-//   Lower = Middle - Multiplier * StandardDeviation
-//
-// BaseResult:
-//
-//   Current:
-//     Latest Middle value.
-//
-//   Previous:
-//     Previous ready Middle value.
+//   Middle
+//   Upper
+//   Lower
+//   InnerUpper
+//   InnerLower
+//   OuterUpper
+//   OuterLower
+//   ChannelWidth
 //
 // Warmup:
-//
-//   First ready result requires Period valid candles.
+//   Period valid candles.
 //
 // Important:
-//
-//   MaxBodyRatio is retained for config compatibility.
-//   It is not used by this SMA/standard-deviation formula.
-//
-//   Entry and Exit conditions are examples, not
-//   guaranteed trading signals.
-//
-//   QuantMan-specific MRC semantics and calculation
-//   parity have not been verified.
+//   This is a reference implementation.
+//   QuantMan's exact MRC width, initialization,
+//   and filter semantics are not verified.
 
 type MeanReversionChannelConfig struct {
-	Period         int
-	Multiplier     float64
-	MaxBodyRatio   float64
-	CandleInterval string
+	Period          int
+	InnerMultiplier float64
+	OuterMultiplier float64
+	FilterType      string
+	CandleInterval  string
 }
 
 type MeanReversionChannelResult struct {
 	BaseResult
-	Middle            float64
-	Upper             float64
-	Lower             float64
-	StandardDeviation float64
+
+	Middle       float64
+	Upper        float64
+	Lower        float64
+	InnerUpper   float64
+	InnerLower   float64
+	OuterUpper   float64
+	OuterLower   float64
+	ChannelWidth float64
 }
 
 type MeanReversionChannel struct {
-	id             string
-	period         int
-	multiplier     float64
-	candleInterval string
+	id  string
+	cfg MeanReversionChannelConfig
 
-	closes []float64
+	count int
 
-	lastTimestamp time.Time
+	previousClose float64
+	hasClose      bool
+
+	pricePrevious1 float64
+	pricePrevious2 float64
+	priceFilter1   float64
+	priceFilter2   float64
+
+	rangePrevious1 float64
+	rangePrevious2 float64
+	rangeFilter1   float64
+	rangeFilter2   float64
+
+	lastTime time.Time
 
 	hasResult bool
 	lastValue float64
@@ -119,32 +128,91 @@ type MeanReversionChannel struct {
 	result MeanReversionChannelResult
 }
 
-func NewMeanReversionChannel(id string, cfg MeanReversionChannelConfig) (*MeanReversionChannel, error) {
+func NewMeanReversionChannel(id string, cfg map[string]any) (*MeanReversionChannel, error) {
 	if id == "" {
-		return nil, fmt.Errorf("MRC name cannot be empty")
+		return nil, fmt.Errorf("meanReversionChannel: indicator id is required")
 	}
 
-	if cfg.Period <= 0 {
-		return nil, fmt.Errorf("MRC period must be positive")
+	config := MeanReversionChannelConfig{
+		Period:          200,
+		InnerMultiplier: 1.0,
+		OuterMultiplier: 2.415,
+		FilterType:      "superSmoother",
+		CandleInterval:  "1 minutes",
 	}
 
-	if math.IsNaN(cfg.Multiplier) ||
-		math.IsInf(cfg.Multiplier, 0) ||
-		cfg.Multiplier < 0 {
-		return nil, fmt.Errorf("MRC multiplier must be finite and non-negative")
+	if value, exists := cfg["period"]; exists {
+		period, ok := value.(int)
+		if !ok {
+			return nil, fmt.Errorf("meanReversionChannel: period must be integer")
+		}
+		config.Period = period
 	}
 
-	if math.IsNaN(cfg.MaxBodyRatio) ||
-		math.IsInf(cfg.MaxBodyRatio, 0) ||
-		cfg.MaxBodyRatio < 0 {
-		return nil, fmt.Errorf("MRC MaxBodyRatio must be finite and non-negative")
+	if value, exists := cfg["innerMultiplier"]; exists {
+		switch v := value.(type) {
+		case int:
+			config.InnerMultiplier = float64(v)
+		case float64:
+			config.InnerMultiplier = v
+		default:
+			return nil, fmt.Errorf("meanReversionChannel: innerMultiplier must be numeric")
+		}
+	}
+
+	if value, exists := cfg["outerMultiplier"]; exists {
+		switch v := value.(type) {
+		case int:
+			config.OuterMultiplier = float64(v)
+		case float64:
+			config.OuterMultiplier = v
+		default:
+			return nil, fmt.Errorf("meanReversionChannel: outerMultiplier must be numeric")
+		}
+	}
+
+	if value, exists := cfg["filterType"]; exists {
+		filterType, ok := value.(string)
+		if !ok {
+			return nil, fmt.Errorf("meanReversionChannel: filterType must be string")
+		}
+		config.FilterType = filterType
+	}
+
+	if value, exists := cfg["candleInterval"]; exists {
+		interval, ok := value.(string)
+		if !ok || interval == "" {
+			return nil, fmt.Errorf("meanReversionChannel: invalid candleInterval")
+		}
+		config.CandleInterval = interval
+	}
+
+	if config.Period < 3 {
+		return nil, fmt.Errorf("meanReversionChannel: period must be at least 3")
+	}
+
+	if math.IsNaN(config.InnerMultiplier) ||
+		math.IsInf(config.InnerMultiplier, 0) ||
+		config.InnerMultiplier < 0 {
+		return nil, fmt.Errorf("meanReversionChannel: invalid innerMultiplier")
+	}
+
+	if math.IsNaN(config.OuterMultiplier) ||
+		math.IsInf(config.OuterMultiplier, 0) ||
+		config.OuterMultiplier < config.InnerMultiplier {
+		return nil, fmt.Errorf("meanReversionChannel: invalid outerMultiplier")
+	}
+
+	if config.FilterType != "superSmoother" {
+		return nil, fmt.Errorf(
+			"meanReversionChannel: filterType %q is not implemented",
+			config.FilterType,
+		)
 	}
 
 	return &MeanReversionChannel{
-		id:             id,
-		period:         cfg.Period,
-		multiplier:     cfg.Multiplier,
-		candleInterval: cfg.CandleInterval,
+		id:  id,
+		cfg: config,
 	}, nil
 }
 
@@ -158,25 +226,86 @@ func (r *MeanReversionChannel) Result() any {
 }
 
 func (r *MeanReversionChannel) ingest(candle core.MarketCandle) {
-	
-	if !validMeanReversionChannelCandle(candle, r.lastTimestamp) {
+	if !validMeanReversionChannelCandle(candle, r.lastTime) {
+		r.result.IsReady = false
 		return
 	}
 
 	timestamp := candle.GetTime()
+	high := candle.GetHigh()
+	low := candle.GetLow()
 	closePrice := candle.GetClose()
 
-	r.lastTimestamp = timestamp
+	// Step 1: Calculate True Range.
+	trueRange := high - low
 
-	// Maintain rolling closing prices.
-	r.closes = append(r.closes, closePrice)
-
-	if len(r.closes) > r.period {
-		r.closes = r.closes[1:]
+	if r.hasClose {
+		trueRange = math.Max(
+			trueRange,
+			math.Max(
+				math.Abs(high-r.previousClose),
+				math.Abs(low-r.previousClose),
+			),
+		)
 	}
 
-	// Wait until the configured period is ready.
-	if len(r.closes) < r.period {
+	r.previousClose = closePrice
+	r.hasClose = true
+	r.lastTime = timestamp
+	r.count++
+
+	// Step 2: Calculate Super Smoother coefficients.
+	period := float64(r.cfg.Period)
+
+	a1 := math.Exp(-math.Sqrt2 * math.Pi / period)
+	b1 := 2 * a1 * math.Cos(math.Sqrt2*math.Pi/period)
+
+	c2 := b1
+	c3 := -a1 * a1
+	c1 := 1 - c2 - c3
+
+	// Step 3: Initialize filter state.
+	if r.count == 1 {
+		r.pricePrevious1 = closePrice
+		r.pricePrevious2 = closePrice
+		r.priceFilter1 = closePrice
+		r.priceFilter2 = closePrice
+
+		r.rangePrevious1 = trueRange
+		r.rangePrevious2 = trueRange
+		r.rangeFilter1 = trueRange
+		r.rangeFilter2 = trueRange
+	}
+
+	// Step 4: Calculate filtered Middle and Width.
+	middle := closePrice
+	width := trueRange
+
+	if r.count > 1 {
+		middle = c1*(closePrice+r.pricePrevious1)/2 +
+			c2*r.priceFilter1 +
+			c3*r.priceFilter2
+
+		width = c1*(trueRange+r.rangePrevious1)/2 +
+			c2*r.rangeFilter1 +
+			c3*r.rangeFilter2
+	}
+
+	// Step 5: Update recursive filter state.
+	r.pricePrevious2 = r.pricePrevious1
+	r.pricePrevious1 = closePrice
+
+	r.priceFilter2 = r.priceFilter1
+	r.priceFilter1 = middle
+
+	r.rangePrevious2 = r.rangePrevious1
+	r.rangePrevious1 = trueRange
+
+	r.rangeFilter2 = r.rangeFilter1
+	r.rangeFilter1 = width
+
+	// Step 6: Wait for configured warmup.
+	if r.count < r.cfg.Period {
 		r.result = MeanReversionChannelResult{
 			BaseResult: BaseResult{
 				IsReady:   false,
@@ -186,49 +315,33 @@ func (r *MeanReversionChannel) ingest(candle core.MarketCandle) {
 		return
 	}
 
-	// Calculate rolling SMA.
-	var sum float64
+	// Step 7: Calculate channel bands.
+	innerUpper := middle + r.cfg.InnerMultiplier*width
+	innerLower := middle - r.cfg.InnerMultiplier*width
 
-	for _, value := range r.closes {
-		sum += value
-	}
+	outerUpper := middle + r.cfg.OuterMultiplier*width
+	outerLower := middle - r.cfg.OuterMultiplier*width
 
-	middle := sum / float64(r.period)
-
-	// Calculate population variance.
-	var squaredSum float64
-
-	for _, value := range r.closes {
-		difference := value - middle
-		squaredSum += difference * difference
-	}
-
-	variance := squaredSum / float64(r.period)
-	standardDeviation := math.Sqrt(variance)
-
-	// Calculate channel bands.
-	upper := middle + r.multiplier*standardDeviation
-	lower := middle - r.multiplier*standardDeviation
-
-	// Reject non-finite results.
+	// Step 8: Validate calculated results.
 	for _, value := range []float64{
-		middle,
-		standardDeviation,
-		upper,
-		lower,
+		middle, width,
+		innerUpper, innerLower,
+		outerUpper, outerLower,
 	} {
 		if math.IsNaN(value) || math.IsInf(value, 0) {
+			r.result.IsReady = false
 			return
 		}
 	}
 
-	// Previous equals Current on first ready candle.
+	// Step 9: Previous ready Middle.
 	previous := middle
 
 	if r.hasResult {
 		previous = r.lastValue
 	}
 
+	// Step 10: Update result.
 	r.result = MeanReversionChannelResult{
 		BaseResult: BaseResult{
 			IsReady:   true,
@@ -236,18 +349,20 @@ func (r *MeanReversionChannel) ingest(candle core.MarketCandle) {
 			Previous:  previous,
 			Timestamp: timestamp,
 		},
-		Middle:            middle,
-		Upper:             upper,
-		Lower:             lower,
-		StandardDeviation: standardDeviation,
+		Middle:       middle,
+		Upper:        outerUpper,
+		Lower:        outerLower,
+		InnerUpper:   innerUpper,
+		InnerLower:   innerLower,
+		OuterUpper:   outerUpper,
+		OuterLower:   outerLower,
+		ChannelWidth: width,
 	}
 
 	r.lastValue = middle
 	r.hasResult = true
 }
 
-// Own validation helper for Mean Reversion Channel.
-// No dependency on helpers from other indicator files.
 func validMeanReversionChannelCandle(candle core.MarketCandle, lastTimestamp time.Time) bool {
 	if candle == nil {
 		return false
@@ -259,7 +374,6 @@ func validMeanReversionChannelCandle(candle core.MarketCandle, lastTimestamp tim
 		return false
 	}
 
-	// Reject duplicate and out-of-order candles.
 	if !lastTimestamp.IsZero() && !timestamp.After(lastTimestamp) {
 		return false
 	}
@@ -269,15 +383,8 @@ func validMeanReversionChannelCandle(candle core.MarketCandle, lastTimestamp tim
 	low := candle.GetLow()
 	closePrice := candle.GetClose()
 
-	for _, value := range []float64{
-		open,
-		high,
-		low,
-		closePrice,
-	} {
-		if math.IsNaN(value) ||
-			math.IsInf(value, 0) ||
-			value <= 0 {
+	for _, value := range []float64{open, high, low, closePrice} {
+		if math.IsNaN(value) || math.IsInf(value, 0) || value <= 0 {
 			return false
 		}
 	}

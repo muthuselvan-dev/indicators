@@ -7,119 +7,167 @@ import (
 	"time"
 )
 
-// describe: Exponential Moving Average
+// describe: Exponential Moving Average (EMA)
 //
-// pipeConfigs: [{type: 'eMA', name: 'eMA', config: {period: <user supplied>, candleInterval: <user supplied>}}]
+// pipeConfigs:
+// [
+//   {
+//     type: 'eMA',
+//     name: 'eMA',
+//     config: {
+//       period: 9,
+//       candleInterval: '1 minutes'
+//     }
+//   }
+// ]
 //
-// Available result: Current, Previous, IsReady, Timestamp and indicator-specific fields in types.go.
-// Entry Condition: Example - Previous <= 0 && Current > 0 (where meaningful); strategy decides entry.
-// Exit Condition: Example - Previous >= 0 && Current < 0 (where meaningful); strategy decides exit.
-// Original Formula: Exponential Moving Average; see independent calculation in ingest.
-// Current is the latest value; Previous is the preceding ready value.
-// First ready value requires configured warm-up candles; see ingest.
+// Original Formula:
+//
+// Multiplier = 2 / (Period + 1)
+//
+// Initial EMA = SMA of first Period closing prices
+//
+// EMA = PreviousEMA +
+//       Multiplier * (CurrentClose - PreviousEMA)
+//
+// Available Result:
+//   - Current
+//   - Previous
+//   - IsReady
+//   - Timestamp
+//
+// Entry/Exit conditions are handled by the strategy.
+
 type EMAConfig struct {
 	Period         int
 	CandleInterval string
 }
 
 type EMA struct {
-	id            string
-	cfg           EMAConfig
-	closes        []float64
-	highs         []float64
-	lows          []float64
+	id  string
+	cfg EMAConfig
+
 	lastTimestamp time.Time
-	seeded        bool
-	hasResult     bool
-	value         float64
-	upper         float64
-	lower         float64
-	direction     int
-	sar           float64
-	extreme       float64
-	accel         float64
-	result        EMAResult
+
+	// Initial SMA warm-up
+	count int
+	sum   float64
+
+	// EMA state
+	hasResult bool
+	value     float64
+
+	result EMAResult
 }
 
-func NewEMA(id string, cfg EMAConfig) (*EMA, error) {
+func NewEMA(id string, cfg map[string]any) (*EMA, error) {
 	if id == "" {
 		return nil, fmt.Errorf("indicator id is required")
 	}
-	if cfg.Period <= 0 {
+
+	period := 9
+	candleInterval := "1 minutes"
+
+	if value, ok := cfg["period"].(int); ok {
+		period = value
+	}
+
+	if value, ok := cfg["candleInterval"].(string); ok {
+		candleInterval = value
+	}
+
+	if period <= 0 {
 		return nil, fmt.Errorf("EMA: period must be positive")
 	}
-	return &EMA{id: id, cfg: cfg}, nil
+
+	return &EMA{
+		id: id,
+		cfg: EMAConfig{
+			Period:         period,
+			CandleInterval: candleInterval,
+		},
+	}, nil
 }
-func (s *EMA) Update(candle core.MarketCandle) any { s.ingest(candle); return s.result }
-func (s *EMA) Result() any                         { return s.result }
+
+func (s *EMA) Update(candle core.MarketCandle) any {
+	s.ingest(candle)
+	return s.result
+}
+
+func (s *EMA) Result() any {
+	return s.result
+}
+
 func (s *EMA) ingest(candle core.MarketCandle) {
 	if candle == nil {
 		return
 	}
-	timestamp, high, low, close := candle.GetTime(), candle.GetHigh(), candle.GetLow(), candle.GetClose()
-	if timestamp.IsZero() || (!s.lastTimestamp.IsZero() && !timestamp.After(s.lastTimestamp)) || math.IsNaN(high) || math.IsInf(high, 0) || math.IsNaN(low) || math.IsInf(low, 0) || math.IsNaN(close) || math.IsInf(close, 0) || low <= 0 || high < low || close <= 0 {
+
+	timestamp := candle.GetTime()
+	high := candle.GetHigh()
+	low := candle.GetLow()
+	closePrice := candle.GetClose()
+
+	// Validate candle data.
+	if timestamp.IsZero() ||
+		(!s.lastTimestamp.IsZero() &&
+			!timestamp.After(s.lastTimestamp)) ||
+		math.IsNaN(high) ||
+		math.IsInf(high, 0) ||
+		math.IsNaN(low) ||
+		math.IsInf(low, 0) ||
+		math.IsNaN(closePrice) ||
+		math.IsInf(closePrice, 0) ||
+		low <= 0 ||
+		high < low ||
+		closePrice <= 0 {
+
 		s.result.IsReady = false
 		return
 	}
+
 	s.lastTimestamp = timestamp
-	s.closes = append(s.closes, close)
-	s.highs = append(s.highs, high)
-	s.lows = append(s.lows, low)
-	// Preserve a bounded window for memory efficiency while retaining sufficient warmup history.
-	cfg := s.cfg
-	maxHistory := max(500, 4*cfg.Period+10)
-	if len(s.closes) > maxHistory {
-		s.closes = s.closes[1:]
-		s.highs = s.highs[1:]
-		s.lows = s.lows[1:]
-	}
-	period := cfg.Period
-	closes, highs, lows := s.closes, s.highs, s.lows
-	if len(closes) < period {
-		s.result.IsReady = false
-		s.result.Timestamp = timestamp
+	s.result.Timestamp = timestamp
+	s.result.IsReady = false
+
+	period := s.cfg.Period
+
+	// Warm-up: calculate initial SMA.
+	if !s.hasResult {
+		s.sum += closePrice
+		s.count++
+
+		if s.count < period {
+			return
+		}
+
+		current := s.sum / float64(period)
+
+		s.result.Current = current
+		s.result.Previous = current
+		s.result.IsReady = true
+
+		s.value = current
+		s.hasResult = true
+
 		return
 	}
-	_ = cfg
-	_ = high
-	_ = low
-	_ = highs
-	_ = lows
-	var current float64
-	if !s.seeded {
-		current = s.avg(closes[len(closes)-period:])
-		s.seeded = true
-	} else {
-		current = (close-s.value)*(2.0/float64(period+1)) + s.value
-	}
+
+	// Standard EMA calculation.
+	multiplier := 2.0 / float64(period+1)
+
+	previous := s.value
+
+	current := previous +
+		multiplier*(closePrice-previous)
+
 	if math.IsNaN(current) || math.IsInf(current, 0) {
-		s.result.IsReady = false
 		return
 	}
-	previous := current
-	if s.hasResult {
-		previous = s.value
-	}
-	s.result.IsReady = true
+
 	s.result.Current = current
 	s.result.Previous = previous
-	s.result.Timestamp = timestamp
+	s.result.IsReady = true
+
 	s.value = current
-	s.hasResult = true
-}
-func (s *EMA) avg(values []float64) float64 {
-	var sum float64
-	for _, v := range values {
-		sum += v
-	}
-	return sum / float64(len(values))
-}
-func (s *EMA) weighted(values []float64) float64 {
-	var sum, den float64
-	for i, v := range values {
-		w := float64(i + 1)
-		sum += v * w
-		den += w
-	}
-	return sum / den
 }

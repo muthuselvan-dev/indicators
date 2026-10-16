@@ -10,7 +10,6 @@ import (
 // describe: Long Buildup
 //
 // Long Buildup occurs when both price and Open Interest increase.
-// It generally indicates fresh long positions entering the market.
 //
 // pipeConfigs: [
 //
@@ -19,7 +18,7 @@ import (
 //	  name: 'longBuildup',
 //	  config: {
 //	    candleInterval: '1 minutes',
-//	  },
+//	  }
 //	}
 //
 // ],
@@ -50,54 +49,23 @@ import (
 //   Long Buildup Becomes False
 //   Previous == true && Current == false
 //
-// Original Classification Rule:
+// Formula:
 //
-//   PriceChange = CurrentClose - PreviousClose
+// PriceChange = CurrentClose - PreviousClose
 //
-//   OpenInterestChange = CurrentOI - PreviousOI
+// OpenInterestChange = CurrentOI - PreviousOI
 //
-//   Long Buildup =
-//     (PriceChange > 0) && (OpenInterestChange > 0)
+// Long Buildup =
+//   (PriceChange > 0) && (OpenInterestChange > 0)
 //
-// Explanation:
-//
-//   Current represents the latest Long Buildup classification.
-//
-//   Previous represents the preceding ready classification.
-//
-//   PriceChange represents the difference between
-//   the current close and previous close.
-//
-//   OpenInterestChange represents the difference between
-//   the current and previous Open Interest.
-//
-//   IsReady becomes true after two valid candles.
-//
-//   Entry and Exit conditions are examples.
-//   Strategy logic determines the actual trading conditions.
-//
-// Reference:
-// https://www.nseindia.com/learn/overview-about-derivatives
+// IsReady becomes true after two valid candles.
 //
 // Note:
-// This uses the standard price/OI classification.
 // QuantMan exact calculation parity is not yet verified.
 
-type LongBuildupConfig struct {
-	CandleInterval string
-}
-
-type LongBuildupResult struct {
-	IsReady            bool
-	Current            bool
-	Previous           bool
-	PriceChange        float64
-	OpenInterestChange float64
-	Timestamp          time.Time
-}
-
 type LongBuildup struct {
-	id             string
+	id string
+
 	candleInterval string
 
 	previousClose float64
@@ -112,14 +80,16 @@ type LongBuildup struct {
 	result LongBuildupResult
 }
 
-func NewLongBuildup(id string, cfg LongBuildupConfig) (*LongBuildup, error) {
+func NewLongBuildup(id string, cfg map[string]any) (*LongBuildup, error) {
 	if id == "" {
 		return nil, fmt.Errorf("Long Buildup name cannot be empty")
 	}
 
+	candleInterval, _ := cfg["candleInterval"].(string)
+
 	return &LongBuildup{
 		id:             id,
-		candleInterval: cfg.CandleInterval,
+		candleInterval: candleInterval,
 	}, nil
 }
 
@@ -133,8 +103,7 @@ func (r *LongBuildup) Result() any {
 }
 
 func (r *LongBuildup) ingest(candle core.MarketCandle) {
-	if !validLongBuildupCandle(candle) {
-		r.result = LongBuildupResult{}
+	if candle == nil {
 		return
 	}
 
@@ -142,9 +111,16 @@ func (r *LongBuildup) ingest(candle core.MarketCandle) {
 	openInterest := candle.GetOpenInterest()
 	timestamp := candle.GetTime()
 
-	// Reject duplicate or out-of-order candles.
-	if !r.lastTimestamp.IsZero() &&
-		!timestamp.After(r.lastTimestamp) {
+	// Reject invalid candle data.
+	if timestamp.IsZero() ||
+		math.IsNaN(closePrice) ||
+		math.IsInf(closePrice, 0) ||
+		closePrice <= 0 ||
+		math.IsNaN(openInterest) ||
+		math.IsInf(openInterest, 0) ||
+		openInterest < 0 ||
+		(!r.lastTimestamp.IsZero() &&
+			!timestamp.After(r.lastTimestamp)) {
 
 		r.result = LongBuildupResult{
 			IsReady:   false,
@@ -194,27 +170,4 @@ func (r *LongBuildup) ingest(candle core.MarketCandle) {
 
 	r.lastValue = current
 	r.hasResult = true
-}
-
-func validLongBuildupCandle(candle core.MarketCandle) bool {
-	if candle == nil || candle.GetTime().IsZero() {
-		return false
-	}
-
-	closePrice := candle.GetClose()
-	openInterest := candle.GetOpenInterest()
-
-	if math.IsNaN(closePrice) ||
-		math.IsInf(closePrice, 0) ||
-		closePrice <= 0 {
-		return false
-	}
-
-	if math.IsNaN(openInterest) ||
-		math.IsInf(openInterest, 0) ||
-		openInterest < 0 {
-		return false
-	}
-
-	return true
 }

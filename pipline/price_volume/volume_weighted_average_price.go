@@ -4,128 +4,103 @@ import (
 	"fmt"
 	"indicators/core"
 	"math"
+	"strings"
 	"time"
 )
 
 // describe: Volume Weighted Average Price (VWAP)
 //
-// Intraday, candle-based VWAP with daily reset.
-//
-// pipeConfigs: [
-//
-//	{
-//	  type: 'volumeWeightedAveragePrice',
-//	  name: 'volumeWeightedAveragePrice',
-//	  config: {
-//	    candleInterval: '1 minutes',
-//	  },
-//	}
-//
-// ],
-//
-// Available result:
-//
-//   - Current
-//   - Previous
-//   - IsReady
-//   - Timestamp
-//
-// Entry Condition:
-//
-//	Close Is Above VWAP:
-//	  Close > Current
-//
-//	Close Crosses Above VWAP:
-//	  PreviousClose <= Previous && Close > Current
-//
-// Exit Condition:
-//
-//	Close Is Below VWAP:
-//	  Close < Current
-//
-//	Close Crosses Below VWAP:
-//	  PreviousClose >= Previous && Close < Current
+// QuantMan:
+// type: volumeWeightedAveragePrice
+// name: vwap
+// config: {price: "typical"}
 //
 // Original Formula:
+// Typical Price = (High + Low + Close) / 3
+// VWAP = Sum(Price * Volume) / Sum(Volume)
 //
-//	TypicalPrice = (High + Low + Close) / 3
+// Supported price:
+// typical, close, open, high, low, hl2, hlc3, ohlc4
 //
-//	PriceVolume = TypicalPrice * Volume
-//
-//	VWAP = Sum(PriceVolume) / Sum(Volume)
-//
-// Session Rules:
-//
-//   - VWAP resets at each new calendar date.
-//   - Date is determined using candle timestamp's location.
-//   - Zero-volume candles do not affect accumulated sums.
-//   - Duplicate and out-of-order candles are ignored.
-//   - Invalid OHLC or volume values are rejected.
+// Session:
+// Resets when the candle's calendar date changes.
 //
 // Warmup:
+// First candle with positive cumulative volume.
 //
-//   No fixed candle count.
-//   First ready result requires positive session volume.
-//
-// Previous:
-//
-//   On the first ready candle of each session,
-//   Previous equals Current.
-//
-//   Afterwards, Previous stores the prior ready VWAP
-//   within the same session.
-//
-// Reference:
-// https://chartschool.stockcharts.com/table-of-contents/technical-indicators-and-overlays/technical-overlays/volume-weighted-average-price-vwap
+// Result:
+// ScalarResult from price_volume/type.go.
 //
 // Note:
-//
-//   This is a candle-level approximation of VWAP.
-//   QuantMan exact calculation parity is not verified.
+// QuantMan exact parity requires backtest verification.
 
 type VolumeWeightedAveragePriceConfig struct {
+	Price          string
 	CandleInterval string
-}
-
-type VolumeWeightedAveragePriceResult struct {
-	ScalarResult
 }
 
 type VolumeWeightedAveragePrice struct {
 	id             string
-	candleInterval string
-
-	sessionDate string
-
+	cfg            VolumeWeightedAveragePriceConfig
+	sessionDate    string
 	priceVolumeSum float64
 	volumeSum      float64
-
-	previousTimestamp time.Time
-
-	previousValue float64
-	hasResult     bool
-
-	result VolumeWeightedAveragePriceResult
+	lastTime       time.Time
+	hasResult      bool
+	result         ScalarResult
 }
 
-func NewVolumeWeightedAveragePrice(
-	id string,
-	cfg VolumeWeightedAveragePriceConfig,
-) (*VolumeWeightedAveragePrice, error) {
+func NewVolumeWeightedAveragePrice(id string, cfg map[string]any) (*VolumeWeightedAveragePrice, error) {
 	if id == "" {
-		return nil, fmt.Errorf("VWAP name cannot be empty")
+		return nil, fmt.Errorf("VWAP: name cannot be empty")
+	}
+
+	price := "typical"
+	candleInterval := "1 minutes"
+
+	if cfg != nil {
+		if value, exists := cfg["price"]; exists {
+			p, ok := value.(string)
+			if !ok {
+				return nil, fmt.Errorf("VWAP: price must be a string")
+			}
+
+			p = strings.ToLower(strings.TrimSpace(p))
+			if p != "" {
+				price = p
+			}
+		}
+
+		if value, exists := cfg["candleInterval"]; exists {
+			interval, ok := value.(string)
+			if !ok {
+				return nil, fmt.Errorf("VWAP: candleInterval must be a string")
+			}
+
+			interval = strings.TrimSpace(interval)
+			if interval != "" {
+				candleInterval = interval
+			}
+		}
+	}
+
+	switch price {
+	case "typical", "hlc3", "close", "open", "high", "low", "hl2", "ohlc4":
+	default:
+		return nil, fmt.Errorf("VWAP: unsupported price %q", price)
 	}
 
 	return &VolumeWeightedAveragePrice{
-		id:             id,
-		candleInterval: cfg.CandleInterval,
+		id: id,
+		cfg: VolumeWeightedAveragePriceConfig{
+			Price:          price,
+			CandleInterval: candleInterval,
+		},
 	}, nil
 }
 
-func (v *VolumeWeightedAveragePrice) Update(
-	candle core.MarketCandle,
-) any {
-	v.ingest(candle)
+func (v *VolumeWeightedAveragePrice) Update(c core.MarketCandle) any {
+	v.ingest(c)
 	return v.result
 }
 
@@ -133,39 +108,32 @@ func (v *VolumeWeightedAveragePrice) Result() any {
 	return v.result
 }
 
-func (v *VolumeWeightedAveragePrice) ingest(candle core.MarketCandle) {
-
-	if !validVolumeWeightedAveragePriceCandle(
-		candle,
-		v.previousTimestamp,
-	) {
+func (v *VolumeWeightedAveragePrice) ingest(c core.MarketCandle) {
+	if !validVolumeWeightedAveragePriceCandle(c, v.lastTime) {
 		return
 	}
 
-	timestamp := candle.GetTime()
+	t := c.GetTime()
+	o := c.GetOpen()
+	h := c.GetHigh()
+	l := c.GetLow()
+	cl := c.GetClose()
+	volume := c.GetVolume()
 
-	high := candle.GetHigh()
-	low := candle.GetLow()
-	closePrice := candle.GetClose()
-	volume := candle.GetVolume()
+	price := v.calculatePrice(o, h, l, cl)
 
-	sessionDate := timestamp.Format("2006-01-02")
-
-	// Calculate typical price.
-	typicalPrice := (high + low + closePrice) / 3.0
-
-	weightedPrice := typicalPrice * volume
-
-	// Validate calculated values.
-	if math.IsNaN(typicalPrice) ||
-		math.IsInf(typicalPrice, 0) ||
-		math.IsNaN(weightedPrice) ||
-		math.IsInf(weightedPrice, 0) {
+	if !vwapFinite(price) {
 		return
 	}
 
-	// Detect new session without changing existing state yet.
-	newSession := sessionDate != v.sessionDate
+	weightedPrice := price * volume
+
+	if !vwapFinite(weightedPrice) {
+		return
+	}
+
+	day := t.Format("2006-01-02")
+	newSession := day != v.sessionDate
 
 	priceVolumeSum := v.priceVolumeSum
 	volumeSum := v.volumeSum
@@ -178,131 +146,106 @@ func (v *VolumeWeightedAveragePrice) ingest(candle core.MarketCandle) {
 	nextPriceVolumeSum := priceVolumeSum + weightedPrice
 	nextVolumeSum := volumeSum + volume
 
-	// Prevent invalid accumulated values.
-	if math.IsNaN(nextPriceVolumeSum) ||
-		math.IsInf(nextPriceVolumeSum, 0) ||
-		math.IsNaN(nextVolumeSum) ||
-		math.IsInf(nextVolumeSum, 0) {
+	if !vwapFinite(nextPriceVolumeSum) ||
+		!vwapFinite(nextVolumeSum) {
 		return
 	}
 
-	// Commit accepted candle timestamp and session.
-	v.previousTimestamp = timestamp
+	if nextVolumeSum <= 0 {
+		v.lastTime = t
 
-	if newSession {
-		v.sessionDate = sessionDate
-		v.hasResult = false
-		v.previousValue = 0
-	}
-
-	v.priceVolumeSum = nextPriceVolumeSum
-	v.volumeSum = nextVolumeSum
-
-	// VWAP cannot be calculated before positive volume.
-	if v.volumeSum <= 0 {
-		v.result = VolumeWeightedAveragePriceResult{
-			ScalarResult: ScalarResult{
-				IsReady:   false,
-				Timestamp: timestamp,
-			},
+		if newSession {
+			v.sessionDate = day
+			v.hasResult = false
 		}
+
+		v.priceVolumeSum = nextPriceVolumeSum
+		v.volumeSum = nextVolumeSum
+		v.result = ScalarResult{Timestamp: t}
 		return
 	}
 
-	current := v.priceVolumeSum / v.volumeSum
+	current := nextPriceVolumeSum / nextVolumeSum
 
-	if math.IsNaN(current) || math.IsInf(current, 0) {
-		v.result = VolumeWeightedAveragePriceResult{
-			ScalarResult: ScalarResult{
-				IsReady:   false,
-				Timestamp: timestamp,
-			},
-		}
+	if !vwapFinite(current) {
 		return
 	}
 
-	// Previous equals Current on first ready candle.
 	previous := current
 
-	if v.hasResult {
-		previous = v.previousValue
+	if !newSession && v.hasResult {
+		previous = v.result.Current
 	}
 
-	v.result = VolumeWeightedAveragePriceResult{
-		ScalarResult: ScalarResult{
-			IsReady:   true,
-			Current:   current,
-			Previous:  previous,
-			Timestamp: timestamp,
-		},
-	}
-
-	v.previousValue = current
+	v.lastTime = t
+	v.sessionDate = day
+	v.priceVolumeSum = nextPriceVolumeSum
+	v.volumeSum = nextVolumeSum
 	v.hasResult = true
+
+	v.result = ScalarResult{
+		IsReady:   true,
+		Current:   current,
+		Previous:  previous,
+		Timestamp: t,
+	}
 }
 
-// Own validation helper for Volume Weighted Average Price.
-//
-// This function belongs exclusively to VWAP.
-// No dependency on helpers from other indicator files.
-func validVolumeWeightedAveragePriceCandle(candle core.MarketCandle, lastTimestamp time.Time) bool {
-	if candle == nil {
+func (v *VolumeWeightedAveragePrice) calculatePrice(o, h, l, cl float64) float64 {
+	switch v.cfg.Price {
+	case "open":
+		return o
+	case "high":
+		return h
+	case "low":
+		return l
+	case "close":
+		return cl
+	case "hl2":
+		return (h + l) / 2
+	case "ohlc4":
+		return (o + h + l + cl) / 4
+	case "typical", "hlc3":
+		return (h + l + cl) / 3
+	default:
+		return math.NaN()
+	}
+}
+
+func vwapFinite(value float64) bool {
+	return !math.IsNaN(value) && !math.IsInf(value, 0)
+}
+
+func validVolumeWeightedAveragePriceCandle(c core.MarketCandle, lastTime time.Time) bool {
+	if c == nil {
 		return false
 	}
 
-	timestamp := candle.GetTime()
+	t := c.GetTime()
 
-	if timestamp.IsZero() {
+	if t.IsZero() || (!lastTime.IsZero() && !t.After(lastTime)) {
 		return false
 	}
 
-	// Reject duplicate and out-of-order candles.
-	if !lastTimestamp.IsZero() &&
-		!timestamp.After(lastTimestamp) {
+	o := c.GetOpen()
+	h := c.GetHigh()
+	l := c.GetLow()
+	cl := c.GetClose()
+	volume := c.GetVolume()
+
+	if !vwapFinite(o) || !vwapFinite(h) ||
+		!vwapFinite(l) || !vwapFinite(cl) ||
+		!vwapFinite(volume) {
 		return false
 	}
 
-	open := candle.GetOpen()
-	high := candle.GetHigh()
-	low := candle.GetLow()
-	closePrice := candle.GetClose()
-	volume := candle.GetVolume()
-
-	// Validate OHLC.
-	for _, value := range []float64{
-		open,
-		high,
-		low,
-		closePrice,
-	} {
-		if math.IsNaN(value) ||
-			math.IsInf(value, 0) ||
-			value <= 0 {
-			return false
-		}
-	}
-
-	// Validate volume.
-	if math.IsNaN(volume) ||
-		math.IsInf(volume, 0) ||
-		volume < 0 {
+	if o <= 0 || h <= 0 || l <= 0 || cl <= 0 || volume < 0 {
 		return false
 	}
 
-	// Validate OHLC relationships.
-	if high < low {
-		return false
-	}
-
-	if high < math.Max(open, closePrice) {
-		return false
-	}
-
-	if low > math.Min(open, closePrice) {
+	if h < l || h < math.Max(o, cl) || l > math.Min(o, cl) {
 		return false
 	}
 
 	return true
 }
-
-var _ core.Indicator = (*VolumeWeightedAveragePrice)(nil)

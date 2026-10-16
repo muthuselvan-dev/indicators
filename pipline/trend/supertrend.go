@@ -7,158 +7,290 @@ import (
 	"time"
 )
 
-// describe: Super Trend
+// Indicator Name: Supertrend
 //
-// pipeConfigs: [{type: 'supertrend', name: 'supertrend', config: {noOfCandles: <user supplied>, candleInterval: <user supplied>}}]
+// Pipe Config:
+//   type: "superTrend"
+//   name: "superTrend"
+//   config:
+//     period: 10
+//     multiplier: 2
+//     candleInterval: "1 minutes"
 //
-// Available result: Current, Previous, IsReady, Timestamp and indicator-specific fields in types.go.
-// Entry Condition: Example - Previous <= 0 && Current > 0 (where meaningful); strategy decides entry.
-// Exit Condition: Example - Previous >= 0 && Current < 0 (where meaningful); strategy decides exit.
-// Original Formula: Super Trend; see independent calculation in ingest.
-// Current is the latest value; Previous is the preceding ready value.
-// First ready value requires configured warm-up candles; see ingest.
+// Entry Condition (example):
+//   BUY when trend changes from downtrend to uptrend.
+//   Previous Direction == -1 && Current Direction == 1
+//
+// Exit Condition (example):
+//   SELL when trend changes from uptrend to downtrend.
+//   Previous Direction == 1 && Current Direction == -1
+//
+// Original Formula:
+//
+// True Range:
+//   TR = max(High-Low, abs(High-PreviousClose),
+//            abs(Low-PreviousClose))
+//
+// Wilder ATR:
+//   First ATR = SMA(TR, Period)
+//   Next ATR = (PreviousATR*(Period-1) + TR) / Period
+//
+// Basic Upper Band:
+//   (High + Low)/2 + Multiplier*ATR
+//
+// Basic Lower Band:
+//   (High + Low)/2 - Multiplier*ATR
+//
+// Final Upper Band:
+//   BasicUpper if BasicUpper < PreviousUpper
+//   OR PreviousClose > PreviousUpper
+//   Otherwise PreviousUpper
+//
+// Final Lower Band:
+//   BasicLower if BasicLower > PreviousLower
+//   OR PreviousClose < PreviousLower
+//   Otherwise PreviousLower
+//
+// Supertrend:
+//   Uptrend   = FinalLowerBand
+//   Downtrend = FinalUpperBand
+//
+// Result:
+//   Current, Previous, UpperBand, LowerBand,
+//   Direction, IsReady, Timestamp
+//
+// Note:
+// This is a standard Wilder ATR Supertrend variant.
+// QuantMan's exact initialization and comparison
+// conventions require backtest verification.
+
 type SupertrendConfig struct {
 	Period         int
-	CandleInterval string
 	Multiplier     float64
+	CandleInterval string
 }
 
 type Supertrend struct {
-	id            string
-	cfg           SupertrendConfig
-	closes        []float64
-	highs         []float64
-	lows          []float64
+	id  string
+	cfg SupertrendConfig
+
 	lastTimestamp time.Time
-	seeded        bool
-	hasResult     bool
-	value         float64
-	upper         float64
-	lower         float64
-	direction     int
-	sar           float64
-	extreme       float64
-	accel         float64
-	result        SupertrendResult
+
+	count         int
+	previousClose float64
+
+	atrSum   float64
+	atr      float64
+	atrReady bool
+
+	upper     float64
+	lower     float64
+	direction int
+
+	hasResult bool
+	value     float64
+
+	result SupertrendResult
 }
 
-func NewSupertrend(id string, cfg SupertrendConfig) (*Supertrend, error) {
+func NewSupertrend(id string, cfg map[string]any) (*Supertrend, error) {
 	if id == "" {
 		return nil, fmt.Errorf("indicator id is required")
 	}
-	if cfg.Period <= 0 {
-		return nil, fmt.Errorf("Supertrend: period must be positive")
+
+	config := SupertrendConfig{
+		Period:         10,
+		Multiplier:     2,
+		CandleInterval: "1 minutes",
 	}
-	if cfg.Multiplier <= 0 {
-		return nil, fmt.Errorf("multiplier must be positive")
+
+	if value, ok := cfg["period"].(int); ok {
+		config.Period = value
 	}
-	return &Supertrend{id: id, cfg: cfg}, nil
+
+	if value, ok := cfg["multiplier"].(float64); ok {
+		config.Multiplier = value
+	} else if value, ok := cfg["multiplier"].(int); ok {
+		config.Multiplier = float64(value)
+	}
+
+	if value, ok := cfg["candleInterval"].(string); ok {
+		config.CandleInterval = value
+	}
+
+	if config.Period <= 0 ||
+		config.Multiplier <= 0 ||
+		math.IsNaN(config.Multiplier) ||
+		math.IsInf(config.Multiplier, 0) {
+		return nil, fmt.Errorf("invalid Supertrend configuration")
+	}
+
+	return &Supertrend{
+		id:  id,
+		cfg: config,
+	}, nil
 }
-func (s *Supertrend) Update(candle core.MarketCandle) any { s.ingest(candle); return s.result }
-func (s *Supertrend) Result() any                         { return s.result }
+
+func (s *Supertrend) Update(candle core.MarketCandle) any {
+	s.ingest(candle)
+	return s.result
+}
+
+func (s *Supertrend) Result() any {
+	return s.result
+}
+
 func (s *Supertrend) ingest(candle core.MarketCandle) {
+	s.result.IsReady = false
+
 	if candle == nil {
 		return
 	}
-	timestamp, high, low, close := candle.GetTime(), candle.GetHigh(), candle.GetLow(), candle.GetClose()
-	if timestamp.IsZero() || (!s.lastTimestamp.IsZero() && !timestamp.After(s.lastTimestamp)) || math.IsNaN(high) || math.IsInf(high, 0) || math.IsNaN(low) || math.IsInf(low, 0) || math.IsNaN(close) || math.IsInf(close, 0) || low <= 0 || high < low || close <= 0 {
-		s.result.IsReady = false
+
+	timestamp := candle.GetTime()
+	high := candle.GetHigh()
+	low := candle.GetLow()
+	closePrice := candle.GetClose()
+
+	if timestamp.IsZero() ||
+		(!s.lastTimestamp.IsZero() &&
+			!timestamp.After(s.lastTimestamp)) ||
+		math.IsNaN(high) ||
+		math.IsInf(high, 0) ||
+		math.IsNaN(low) ||
+		math.IsInf(low, 0) ||
+		math.IsNaN(closePrice) ||
+		math.IsInf(closePrice, 0) ||
+		low <= 0 ||
+		high < low ||
+		closePrice <= 0 {
+
 		return
 	}
+
 	s.lastTimestamp = timestamp
-	s.closes = append(s.closes, close)
-	s.highs = append(s.highs, high)
-	s.lows = append(s.lows, low)
-	// Preserve a bounded window for memory efficiency while retaining sufficient warmup history.
-	cfg := s.cfg
-	maxHistory := max(500, 4*cfg.Period+10)
-	if len(s.closes) > maxHistory {
-		s.closes = s.closes[1:]
-		s.highs = s.highs[1:]
-		s.lows = s.lows[1:]
+	s.result.Timestamp = timestamp
+
+	period := s.cfg.Period
+
+	// Calculate True Range.
+	tr := high - low
+
+	if s.count > 0 {
+		tr = math.Max(
+			high-low,
+			math.Max(
+				math.Abs(high-s.previousClose),
+				math.Abs(low-s.previousClose),
+			),
+		)
 	}
-	period := cfg.Period
-	closes, highs, lows := s.closes, s.highs, s.lows
-	if len(closes) < period {
-		s.result.IsReady = false
-		s.result.Timestamp = timestamp
+
+	previousClose := s.previousClose
+	s.previousClose = closePrice
+	s.count++
+
+	// Initialize Wilder ATR using first Period TR values.
+	if !s.atrReady {
+		s.atrSum += tr
+
+		if s.count < period {
+			return
+		}
+
+		s.atr = s.atrSum / float64(period)
+		s.atrReady = true
+	} else {
+		s.atr = (s.atr*float64(period-1) + tr) / float64(period)
+	}
+
+	// Calculate basic bands.
+	midPrice := (high + low) / 2.0
+
+	basicUpper := midPrice + s.cfg.Multiplier*s.atr
+	basicLower := midPrice - s.cfg.Multiplier*s.atr
+
+	// First ready candle: initialize bands and direction.
+	if !s.hasResult {
+		s.upper = basicUpper
+		s.lower = basicLower
+
+		// Initial trend is set to downtrend.
+		// This is a convention, not a QuantMan-confirmed rule.
+		s.direction = -1
+
+		s.value = s.upper
+		s.hasResult = true
+
+		s.result.Current = s.value
+		s.result.Previous = s.value
+		s.result.UpperBand = s.upper
+		s.result.LowerBand = s.lower
+		s.result.Direction = s.direction
+		s.result.IsReady = true
 		return
 	}
-	_ = cfg
-	_ = high
-	_ = low
-	_ = highs
-	_ = lows
-	var current float64
-	atrPeriod := period
-	if len(closes) < atrPeriod+1 {
-		s.result.IsReady = false
-		return
+
+	previousUpper := s.upper
+	previousLower := s.lower
+	previousDirection := s.direction
+
+	// Calculate final upper band.
+	finalUpper := basicUpper
+
+	if basicUpper >= previousUpper &&
+		previousClose <= previousUpper {
+		finalUpper = previousUpper
 	}
-	var atr float64
-	for i := len(closes) - atrPeriod; i < len(closes); i++ {
-		tr := math.Max(highs[i]-lows[i], math.Max(math.Abs(highs[i]-closes[i-1]), math.Abs(lows[i]-closes[i-1])))
-		atr += tr
+
+	// Calculate final lower band.
+	finalLower := basicLower
+
+	if basicLower <= previousLower &&
+		previousClose >= previousLower {
+		finalLower = previousLower
 	}
-	atr /= float64(atrPeriod)
-	mid := (high + low) / 2
-	upper := mid + cfg.Multiplier*atr
-	lower := mid - cfg.Multiplier*atr
-	if s.seeded {
-		if upper > s.upper && s.direction < 0 {
-			upper = s.upper
+
+	// Determine trend direction using previous band.
+	direction := previousDirection
+
+	if previousDirection == -1 {
+		// Downtrend -> Uptrend
+		if closePrice > previousUpper {
+			direction = 1
 		}
-		if lower < s.lower && s.direction > 0 {
-			lower = s.lower
+	} else {
+		// Uptrend -> Downtrend
+		if closePrice < previousLower {
+			direction = -1
 		}
 	}
-	direction := s.direction
-	if !s.seeded {
-		direction = 1
-	} else if close > s.upper {
-		direction = 1
-	} else if close < s.lower {
-		direction = -1
+
+	// Select Supertrend value.
+	current := finalLower
+
+	if direction == -1 {
+		current = finalUpper
 	}
-	current = lower
-	if direction < 0 {
-		current = upper
-	}
-	s.upper = upper
-	s.lower = lower
-	s.direction = direction
-	s.seeded = true
-	s.result.UpperBand = upper
-	s.result.LowerBand = lower
-	s.result.Direction = direction
+
 	if math.IsNaN(current) || math.IsInf(current, 0) {
-		s.result.IsReady = false
 		return
 	}
-	previous := current
-	if s.hasResult {
-		previous = s.value
-	}
-	s.result.IsReady = true
+
+	previous := s.value
+
+	// Update state.
+	s.upper = finalUpper
+	s.lower = finalLower
+	s.direction = direction
+	s.value = current
+
+	// Update result.
 	s.result.Current = current
 	s.result.Previous = previous
+	s.result.UpperBand = finalUpper
+	s.result.LowerBand = finalLower
+	s.result.Direction = direction
 	s.result.Timestamp = timestamp
-	s.value = current
-	s.hasResult = true
-}
-func (s *Supertrend) avg(values []float64) float64 {
-	var sum float64
-	for _, v := range values {
-		sum += v
-	}
-	return sum / float64(len(values))
-}
-func (s *Supertrend) weighted(values []float64) float64 {
-	var sum, den float64
-	for i, v := range values {
-		w := float64(i + 1)
-		sum += v * w
-		den += w
-	}
-	return sum / den
+	s.result.IsReady = true
 }

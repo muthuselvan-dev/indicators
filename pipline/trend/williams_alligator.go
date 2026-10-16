@@ -7,123 +7,283 @@ import (
 	"time"
 )
 
-// describe: Williams Alligator
+// Indicator Name: Williams Alligator
 //
-// pipeConfigs: [{type: 'williamsAlligator', name: 'williamsAlligator', config: {period: <user supplied>, candleInterval: <user supplied>}}]
+// Pipe Config:
+//   type: "williamsAlligator"
+//   name: "williamsAlligator"
+//   config:
+//     jawLength: 13
+//     teethLength: 8
+//     lipsLength: 5
+//     jawOffset: 8
+//     teethOffset: 5
+//     lipsOffset: 3
+//     candleInterval: "1 minutes"
 //
-// Available result: Current, Previous, IsReady, Timestamp and indicator-specific fields in types.go.
-// Entry Condition: Example - Previous <= 0 && Current > 0 (where meaningful); strategy decides entry.
-// Exit Condition: Example - Previous >= 0 && Current < 0 (where meaningful); strategy decides exit.
-// Original Formula: Williams Alligator; see independent calculation in ingest.
-// Current is the latest value; Previous is the preceding ready value.
-// First ready value requires configured warm-up candles; see ingest.
+// Entry Condition (example):
+//   BUY when Lips > Teeth && Teeth > Jaw
+//
+// Exit Condition (example):
+//   SELL when Lips < Teeth && Teeth < Jaw
+//
+// Original Formula:
+//
+//   MedianPrice = (High + Low) / 2
+//
+//   First SMMA = SMA(MedianPrice, Length)
+//
+//   Next SMMA =
+//     (PreviousSMMA * (Length - 1) + MedianPrice)
+//     / Length
+//
+//   Jaw   = SMMA(MedianPrice, jawLength)
+//   Teeth = SMMA(MedianPrice, teethLength)
+//   Lips  = SMMA(MedianPrice, lipsLength)
+//
+//   Jaw plotted jawOffset bars forward.
+//   Teeth plotted teethOffset bars forward.
+//   Lips plotted lipsOffset bars forward.
+//
+// Result:
+//   Jaw, Teeth, Lips, Current, Previous,
+//   IsReady, Timestamp
+//
+// Current = Lips - Teeth (compatibility convention).
+// Jaw/Teeth/Lips are unshifted values.
+//
+// QuantMan condition-level offset behavior is not
+// verified by the supplied pipeConfig alone.
+
 type WilliamsAlligatorConfig struct {
-	Period         int
+	JawLength      int
+	TeethLength    int
+	LipsLength     int
+	JawOffset      int
+	TeethOffset    int
+	LipsOffset     int
 	CandleInterval string
-	JawPeriod      int
-	TeethPeriod    int
-	LipsPeriod     int
+}
+
+type alligatorSMMA struct {
+	length int
+	count  int
+	sum    float64
+	value  float64
+	ready  bool
+}
+
+func (m *alligatorSMMA) update(price float64) {
+	m.count++
+
+	if !m.ready {
+		m.sum += price
+
+		if m.count < m.length {
+			return
+		}
+
+		m.value = m.sum / float64(m.length)
+		m.ready = true
+		return
+	}
+
+	m.value = (m.value*float64(m.length-1) + price) / float64(m.length)
 }
 
 type WilliamsAlligator struct {
-	id            string
-	cfg           WilliamsAlligatorConfig
-	closes        []float64
-	highs         []float64
-	lows          []float64
+	id  string
+	cfg WilliamsAlligatorConfig
+
 	lastTimestamp time.Time
-	seeded        bool
-	hasResult     bool
-	value         float64
-	upper         float64
-	lower         float64
-	direction     int
-	sar           float64
-	extreme       float64
-	accel         float64
-	result        WilliamsAlligatorResult
+
+	jaw   alligatorSMMA
+	teeth alligatorSMMA
+	lips  alligatorSMMA
+
+	hasResult bool
+	value     float64
+
+	result WilliamsAlligatorResult
 }
 
-func NewWilliamsAlligator(id string, cfg WilliamsAlligatorConfig) (*WilliamsAlligator, error) {
+func NewWilliamsAlligator(
+	id string,
+	cfg map[string]any,
+) (*WilliamsAlligator, error) {
 	if id == "" {
 		return nil, fmt.Errorf("indicator id is required")
 	}
-	if cfg.JawPeriod <= 0 || cfg.TeethPeriod <= 0 || cfg.LipsPeriod <= 0 {
-		return nil, fmt.Errorf("invalid alligator periods")
+
+	config := WilliamsAlligatorConfig{
+		JawLength:      13,
+		TeethLength:    8,
+		LipsLength:     5,
+		JawOffset:      8,
+		TeethOffset:    5,
+		LipsOffset:     3,
+		CandleInterval: "1 minutes",
 	}
-	return &WilliamsAlligator{id: id, cfg: cfg}, nil
+
+	readInt := func(key string, target *int) error {
+		value, exists := cfg[key]
+		if !exists {
+			return nil
+		}
+
+		parsed, ok := value.(int)
+		if !ok {
+			return fmt.Errorf(
+				"williamsAlligator: %s must be an integer",
+				key,
+			)
+		}
+
+		*target = parsed
+		return nil
+	}
+
+	for _, item := range []struct {
+		key    string
+		target *int
+	}{
+		{"jawLength", &config.JawLength},
+		{"teethLength", &config.TeethLength},
+		{"lipsLength", &config.LipsLength},
+		{"jawOffset", &config.JawOffset},
+		{"teethOffset", &config.TeethOffset},
+		{"lipsOffset", &config.LipsOffset},
+	} {
+		if err := readInt(item.key, item.target); err != nil {
+			return nil, err
+		}
+	}
+
+	if value, exists := cfg["candleInterval"]; exists {
+		interval, ok := value.(string)
+		if !ok || interval == "" {
+			return nil, fmt.Errorf(
+				"williamsAlligator: invalid candleInterval",
+			)
+		}
+		config.CandleInterval = interval
+	}
+
+	if config.JawLength <= 0 ||
+		config.TeethLength <= 0 ||
+		config.LipsLength <= 0 {
+		return nil, fmt.Errorf(
+			"williamsAlligator: lengths must be positive",
+		)
+	}
+
+	if config.JawOffset < 0 ||
+		config.TeethOffset < 0 ||
+		config.LipsOffset < 0 {
+		return nil, fmt.Errorf(
+			"williamsAlligator: offsets cannot be negative",
+		)
+	}
+
+	return &WilliamsAlligator{
+		id:  id,
+		cfg: config,
+
+		jaw: alligatorSMMA{
+			length: config.JawLength,
+		},
+		teeth: alligatorSMMA{
+			length: config.TeethLength,
+		},
+		lips: alligatorSMMA{
+			length: config.LipsLength,
+		},
+	}, nil
 }
-func (s *WilliamsAlligator) Update(candle core.MarketCandle) any { s.ingest(candle); return s.result }
-func (s *WilliamsAlligator) Result() any                         { return s.result }
-func (s *WilliamsAlligator) ingest(candle core.MarketCandle) {
+
+func (s *WilliamsAlligator) Update(
+	candle core.MarketCandle,
+) any {
+	s.ingest(candle)
+	return s.result
+}
+
+func (s *WilliamsAlligator) Result() any {
+	return s.result
+}
+
+func (s *WilliamsAlligator) ingest(
+	candle core.MarketCandle,
+) {
+	s.result.IsReady = false
+
 	if candle == nil {
 		return
 	}
-	timestamp, high, low, close := candle.GetTime(), candle.GetHigh(), candle.GetLow(), candle.GetClose()
-	if timestamp.IsZero() || (!s.lastTimestamp.IsZero() && !timestamp.After(s.lastTimestamp)) || math.IsNaN(high) || math.IsInf(high, 0) || math.IsNaN(low) || math.IsInf(low, 0) || math.IsNaN(close) || math.IsInf(close, 0) || low <= 0 || high < low || close <= 0 {
-		s.result.IsReady = false
+
+	timestamp := candle.GetTime()
+	high := candle.GetHigh()
+	low := candle.GetLow()
+	closePrice := candle.GetClose()
+
+	if timestamp.IsZero() ||
+		(!s.lastTimestamp.IsZero() &&
+			!timestamp.After(s.lastTimestamp)) ||
+		math.IsNaN(high) ||
+		math.IsInf(high, 0) ||
+		math.IsNaN(low) ||
+		math.IsInf(low, 0) ||
+		math.IsNaN(closePrice) ||
+		math.IsInf(closePrice, 0) ||
+		high < low ||
+		low <= 0 ||
+		closePrice <= 0 {
 		return
 	}
+
 	s.lastTimestamp = timestamp
-	s.closes = append(s.closes, close)
-	s.highs = append(s.highs, high)
-	s.lows = append(s.lows, low)
-	// Preserve a bounded window for memory efficiency while retaining sufficient warmup history.
-	cfg := s.cfg
-	maxHistory := max(500, 4*max(cfg.JawPeriod, max(cfg.TeethPeriod, cfg.LipsPeriod))+10)
-	if len(s.closes) > maxHistory {
-		s.closes = s.closes[1:]
-		s.highs = s.highs[1:]
-		s.lows = s.lows[1:]
-	}
-	period := max(cfg.JawPeriod, max(cfg.TeethPeriod, cfg.LipsPeriod))
-	closes, highs, lows := s.closes, s.highs, s.lows
-	if len(closes) < period {
-		s.result.IsReady = false
-		s.result.Timestamp = timestamp
+	s.result.Timestamp = timestamp
+
+	medianPrice := (high + low) / 2.0
+
+	s.jaw.update(medianPrice)
+	s.teeth.update(medianPrice)
+	s.lips.update(medianPrice)
+
+	// All three SMMA values must be initialized.
+	if !s.jaw.ready ||
+		!s.teeth.ready ||
+		!s.lips.ready {
 		return
 	}
-	_ = cfg
-	_ = high
-	_ = low
-	_ = highs
-	_ = lows
-	var current float64
-	jaw := s.avg(closes[len(closes)-cfg.JawPeriod:])
-	teeth := s.avg(closes[len(closes)-cfg.TeethPeriod:])
-	lips := s.avg(closes[len(closes)-cfg.LipsPeriod:])
-	current = lips - teeth
-	s.result.Jaw = jaw
-	s.result.Teeth = teeth
-	s.result.Lips = lips
-	if math.IsNaN(current) || math.IsInf(current, 0) {
-		s.result.IsReady = false
+
+	jaw := s.jaw.value
+	teeth := s.teeth.value
+	lips := s.lips.value
+
+	// Preserve existing single-value convention.
+	current := lips - teeth
+
+	if math.IsNaN(current) ||
+		math.IsInf(current, 0) {
 		return
 	}
+
 	previous := current
+
 	if s.hasResult {
 		previous = s.value
 	}
-	s.result.IsReady = true
+
+	s.result.Jaw = jaw
+	s.result.Teeth = teeth
+	s.result.Lips = lips
+
 	s.result.Current = current
 	s.result.Previous = previous
 	s.result.Timestamp = timestamp
+	s.result.IsReady = true
+
 	s.value = current
 	s.hasResult = true
-}
-func (s *WilliamsAlligator) avg(values []float64) float64 {
-	var sum float64
-	for _, v := range values {
-		sum += v
-	}
-	return sum / float64(len(values))
-}
-func (s *WilliamsAlligator) weighted(values []float64) float64 {
-	var sum, den float64
-	for i, v := range values {
-		w := float64(i + 1)
-		sum += v * w
-		den += w
-	}
-	return sum / den
 }

@@ -87,19 +87,19 @@ type WilliamsPercentRange struct {
 	result WilliamsPercentRangeResult
 }
 
-func NewWilliamsPercentRange(id string, cfg WilliamsPercentRangeConfig) (*WilliamsPercentRange, error) {
+func NewWilliamsPercentRange(id string, cfg map[string]any) (*WilliamsPercentRange, error) {
 	if id == "" {
 		return nil, fmt.Errorf("Williams Percent Range name cannot be empty")
 	}
 
-	if cfg.Period <= 0 {
-		return nil, fmt.Errorf("Williams Percent Range period must be positive: %d", cfg.Period)
+	if cfg["period"].(int) <= 0 {
+		return nil, fmt.Errorf("Williams Percent Range period must be positive: %d", cfg["period"].(int))
 	}
 
 	return &WilliamsPercentRange{
 		id:             id,
-		period:         cfg.Period,
-		candleInterval: cfg.CandleInterval,
+		period:         cfg["period"].(int),
+		candleInterval: cfg["candleInterval"].(string),
 	}, nil
 }
 

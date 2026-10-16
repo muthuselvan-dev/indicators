@@ -1,0 +1,16 @@
+// package aggregate
+
+// import (
+// 	"indicators/core"
+// )
+
+// type Aggregator struct {
+// }
+
+// func NewAggregator() *Aggregator {
+// 	return &Aggregator{}
+// }
+
+// func (a *Aggregator) Aggregate(candle core.MarketCandle) (core.MarketCandle, bool) {
+// 	return nil, false
+// }

@@ -10,3 +10,12 @@ type ScalarResult struct {
 	Previous  float64
 	Timestamp time.Time
 }
+
+type QQESignalsResult struct {
+	QQELong   float64
+	QQEShort  float64
+	IsLong    bool
+	IsShort   bool
+	IsReady   bool
+	Timestamp time.Time
+}
