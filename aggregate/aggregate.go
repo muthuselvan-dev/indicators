@@ -24,9 +24,17 @@ func NewAggregator(config map[string]any) (*Aggregator, error) {
 	}
 
 	candleInterval, ok := config["candleInterval"].(string)
-
 	if !ok || strings.TrimSpace(candleInterval) == "" {
 		return nil, fmt.Errorf("aggregate: candleInterval required")
+	}
+
+	candleDuration, err := ParseInterval(candleInterval)
+	if err != nil {
+		return nil, fmt.Errorf("aggregate: candleInterval: %w", err)
+	}
+
+	if candleDuration < time.Minute || candleDuration%time.Minute != 0 {
+		return nil, fmt.Errorf("aggregate: candleInterval must be whole minutes")
 	}
 
 	if chartType == "volumeCandle" {
@@ -34,10 +42,20 @@ func NewAggregator(config map[string]any) (*Aggregator, error) {
 		if !ok || strings.TrimSpace(volumeInterval) == "" {
 			return nil, fmt.Errorf("aggregate: volumeInterval required")
 		}
+
+		volumeDuration, err := ParseInterval(volumeInterval)
+		if err != nil {
+			return nil, fmt.Errorf("aggregate: volumeInterval: %w", err)
+		}
+
+		if volumeDuration < time.Minute ||
+			volumeDuration%time.Minute != 0 ||
+			volumeDuration > candleDuration {
+			return nil, fmt.Errorf("aggregate: invalid volumeInterval")
+		}
 	}
 
 	var chart ChartProcessor
-	var err error
 
 	switch chartType {
 	case "candle":

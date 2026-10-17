@@ -24,31 +24,14 @@ type VolumeChart struct {
 
 func NewVolumeChart(id string, cfg map[string]any) (*VolumeChart, error) {
 
-	candleIntervalStr, ok := cfg["candleInterval"].(string)
-	if !ok {
-		return nil, fmt.Errorf("VolumeChart: candleInterval must be a string")
-	}
-
-	candleInterval, err := ParseInterval(candleIntervalStr)
+	candleInterval, err := ParseInterval(cfg["candleInterval"].(string))
 	if err != nil {
 		return nil, fmt.Errorf("VolumeChart: %w", err)
 	}
 
-	volumeIntervalStr, ok := cfg["volumeInterval"].(string)
-	if !ok {
-		return nil, fmt.Errorf("VolumeChart: volumeInterval must be a string")
-	}
-
-	volumeInterval, err := ParseInterval(volumeIntervalStr)
+	volumeInterval, err := ParseInterval(cfg["volumeInterval"].(string))
 	if err != nil {
 		return nil, fmt.Errorf("VolumeChart: %w", err)
-	}
-
-	if candleInterval < time.Minute || volumeInterval < time.Minute || candleInterval%time.Minute != 0 ||
-		volumeInterval%time.Minute != 0 ||
-		volumeInterval > candleInterval {
-
-		return nil, fmt.Errorf("VolumeChart: invalid intervals")
 	}
 
 	return &VolumeChart{

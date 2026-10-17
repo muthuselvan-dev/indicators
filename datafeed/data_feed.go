@@ -1,0 +1,157 @@
+package datafeed
+
+import (
+	"fmt"
+	"sort"
+	"time"
+)
+
+type DataFeed struct {
+	Tickers []Ticker
+	Candles []Candle
+
+	subscribed map[int]bool
+	future     int
+}
+
+func NewDataFeed() (*DataFeed, error) {
+
+	df := &DataFeed{
+		Tickers:    make([]Ticker, 0),
+		Candles:    make([]Candle, 0),
+		subscribed: make(map[int]bool),
+	}
+
+	if err := df.loadDatabase(); err != nil {
+		return nil, fmt.Errorf("database loading failed: %w", err)
+	}
+
+	for _, ticker := range df.Tickers {
+		if ticker.TradingSymbol == "BANKNIFTY28AUG25FUT.NFO" {
+			df.future = ticker.Token
+			break
+		}
+	}
+
+	if df.future == 0 {
+		return nil, fmt.Errorf("BANKNIFTY FUT token not found")
+	}
+
+	return df, nil
+}
+
+func (df *DataFeed) FeedData(callback func([]Candle) error) error {
+	data := make(map[int][]Candle)
+
+	for _, candle := range df.Candles {
+		data[candle.Token] = append(data[candle.Token], candle)
+	}
+
+	for token := range data {
+		sort.Slice(data[token], func(i, j int) bool {
+			return data[token][i].Timestamp.Before(data[token][j].Timestamp)
+		})
+	}
+
+	futures := data[df.future]
+	if len(futures) == 0 {
+		return fmt.Errorf("BANKNIFTY FUT candles not found")
+	}
+
+	ist := time.FixedZone("IST", 5*3600+30*60)
+
+	for day := futures[0].Timestamp.In(ist); !day.After(futures[len(futures)-1].Timestamp.In(ist)); day = day.AddDate(0, 0, 1) {
+		if day.Weekday() == time.Saturday || day.Weekday() == time.Sunday {
+			continue
+		}
+
+		start := time.Date(day.Year(), day.Month(), day.Day(), 9, 15, 59, 0, ist)
+		end := time.Date(day.Year(), day.Month(), day.Day(), 15, 30, 59, 0, ist)
+
+		for current := start; !current.After(end); current = current.Add(time.Minute) {
+			tokens := []int{df.future}
+
+			for token := range df.subscribed {
+				if token != df.future {
+					tokens = append(tokens, token)
+				}
+			}
+
+			sort.Ints(tokens)
+
+			var candles []Candle
+
+			for _, token := range tokens {
+				candle, ok := findCandle(data[token], current)
+				if !ok {
+					continue
+				}
+
+				candles = append(candles, candle)
+			}
+
+			if len(candles) == 0 {
+				continue
+			}
+
+			if err := callback(candles); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func (df *DataFeed) Subscribe(token int) error {
+	for _, ticker := range df.Tickers {
+		if ticker.Token == token {
+			df.subscribed[token] = true
+			return nil
+		}
+	}
+
+	return fmt.Errorf("token %d not found", token)
+}
+
+func (df *DataFeed) Unsubscribe(token int) error {
+	delete(df.subscribed, token)
+	return nil
+}
+
+func findCandle(candles []Candle, timestamp time.Time) (Candle, bool) {
+	if len(candles) == 0 {
+		return Candle{}, false
+	}
+
+	ist := time.FixedZone("IST", 5*3600+30*60)
+	currentDay := timestamp.In(ist).Format("2006-01-02")
+
+	index := sort.Search(len(candles), func(i int) bool {
+		return !candles[i].Timestamp.Before(timestamp)
+	})
+
+	if index < len(candles) && candles[index].Timestamp.Equal(timestamp) {
+		return candles[index], true
+	}
+
+	if index > 0 {
+		previous := candles[index-1]
+
+		if previous.Timestamp.In(ist).Format("2006-01-02") == currentDay {
+			previous.Timestamp = timestamp
+			return previous, true
+		}
+	}
+
+	if index < len(candles) {
+		next := candles[index]
+
+		if next.Timestamp.In(ist).Format("2006-01-02") == currentDay {
+			next.Timestamp = timestamp
+			return next, true
+		}
+	}
+
+	return Candle{}, false
+}

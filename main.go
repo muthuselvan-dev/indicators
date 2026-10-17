@@ -15,7 +15,7 @@ func main() {
 	// Standard Candle
 	// aggregateConfig := map[string]any{
 	// 	"type":           "candle",
-	// 	"candleInterval": "1 h",
+	// 	"candleInterval": "1 minute",
 	// }
 
 	// Heikin Ashi
@@ -28,7 +28,7 @@ func main() {
 	aggregateConfig := map[string]any{
 		"type":           "volumeCandle",
 		"candleInterval": "1 h",
-		"volumeInterval": "5 min",
+		"volumeInterval": "1 h",
 	}
 
 	engine, err := aggregate.NewAggregator(aggregateConfig)

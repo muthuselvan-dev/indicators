@@ -1,0 +1,227 @@
+package datafeed
+
+import (
+	"fmt"
+	"sort"
+	"time"
+)
+
+type candleRange struct {
+	start int
+	end   int
+}
+
+type DataFeed struct {
+	Tickers []Ticker
+	Candles []Candle
+
+	subscribed map[int]bool
+	future     int
+	ranges     map[int]candleRange
+}
+
+var ist = time.FixedZone("IST", 5*3600+30*60)
+
+func NewDataFeed() (*DataFeed, error) {
+
+	df := &DataFeed{
+		subscribed: make(map[int]bool),
+		ranges:     make(map[int]candleRange),
+	}
+
+	if err := df.loadDatabase(); err != nil {
+		return nil, fmt.Errorf("database loading failed: %w", err)
+	}
+
+	for _, ticker := range df.Tickers {
+		if ticker.TradingSymbol == "BANKNIFTY28AUG25FUT.NFO" {
+			df.future = ticker.Token
+			break
+		}
+	}
+
+	if df.future == 0 {
+		return nil, fmt.Errorf("BANKNIFTY FUT token not found")
+	}
+
+	// Sort original candles in-place.
+	// No second copy of the candle dataset.
+	sort.Slice(df.Candles, func(i, j int) bool {
+		a := df.Candles[i]
+		b := df.Candles[j]
+
+		if a.Token != b.Token {
+			return a.Token < b.Token
+		}
+
+		return a.Timestamp.Before(b.Timestamp)
+	})
+
+	// Store only index ranges, not candle copies.
+	for i := 0; i < len(df.Candles); {
+		token := df.Candles[i].Token
+		start := i
+
+		for i < len(df.Candles) && df.Candles[i].Token == token {
+			i++
+		}
+
+		df.ranges[token] = candleRange{
+			start: start,
+			end:   i,
+		}
+	}
+
+	if r, ok := df.ranges[df.future]; !ok || r.start == r.end {
+		return nil, fmt.Errorf("BANKNIFTY FUT candles not found")
+	}
+
+	return df, nil
+}
+
+func (df *DataFeed) FeedData(callback func([]Candle) error) error {
+	r := df.ranges[df.future]
+	futures := df.Candles[r.start:r.end]
+
+	firstDay := futures[0].Timestamp.In(ist)
+	lastDay := futures[len(futures)-1].Timestamp.In(ist)
+
+	for day := time.Date(
+		firstDay.Year(), firstDay.Month(), firstDay.Day(),
+		0, 0, 0, 0, ist,
+	); !day.After(lastDay); day = day.AddDate(0, 0, 1) {
+
+		if day.Weekday() == time.Saturday ||
+			day.Weekday() == time.Sunday {
+			continue
+		}
+
+		start := time.Date(
+			day.Year(), day.Month(), day.Day(),
+			9, 15, 59, 0, ist,
+		)
+
+		end := time.Date(
+			day.Year(), day.Month(), day.Day(),
+			15, 30, 59, 0, ist,
+		)
+
+		for current := start; !current.After(end); current = current.Add(time.Minute) {
+			tokens := make([]int, 0, len(df.subscribed)+1)
+			tokens = append(tokens, df.future)
+
+			for token := range df.subscribed {
+				if token != df.future {
+					tokens = append(tokens, token)
+				}
+			}
+
+			sort.Ints(tokens)
+
+			candles := make([]Candle, 0, len(tokens))
+
+			for _, token := range tokens {
+				r, ok := df.ranges[token]
+				if !ok {
+					continue
+				}
+
+				candle, found := findCandle(
+					df.Candles[r.start:r.end],
+					current,
+				)
+
+				if found {
+					candles = append(candles, candle)
+				}
+			}
+
+			if len(candles) == 0 {
+				continue
+			}
+
+			if err := callback(candles); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func (df *DataFeed) Subscribe(token int) error {
+	for _, ticker := range df.Tickers {
+		if ticker.Token == token {
+			df.subscribed[token] = true
+			return nil
+		}
+	}
+
+	return fmt.Errorf("token %d not found", token)
+}
+
+func (df *DataFeed) Unsubscribe(token int) error {
+	delete(df.subscribed, token)
+	return nil
+}
+
+func findCandle(candles []Candle, timestamp time.Time) (Candle, bool) {
+	if len(candles) == 0 {
+		return Candle{}, false
+	}
+
+	index := sort.Search(len(candles), func(i int) bool {
+		return !candles[i].Timestamp.Before(timestamp)
+	})
+
+	// 1. Exact candle exists.
+	if index < len(candles) &&
+		candles[index].Timestamp.Equal(timestamp) {
+		return candles[index], true
+	}
+
+	dayStart := time.Date(
+		timestamp.In(ist).Year(),
+		timestamp.In(ist).Month(),
+		timestamp.In(ist).Day(),
+		0, 0, 0, 0, ist,
+	)
+
+	// 2. Previous actual candle from the same day.
+	if index > 0 {
+		previous := candles[index-1]
+
+		if !previous.Timestamp.Before(dayStart) {
+			previous.Timestamp = timestamp
+			return previous, true
+		}
+	}
+
+	// 3. First actual candle of the current day has not arrived.
+	// Prefer the last actual candle from the previous trading date.
+	if index > 0 {
+		previous := candles[index-1]
+
+		if previous.Timestamp.Before(dayStart) {
+			previous.Timestamp = timestamp
+			return previous, true
+		}
+	}
+
+	// 4. No previous actual candle available.
+	// Use the next actual candle only from the current day.
+	if index < len(candles) {
+		next := candles[index]
+
+		nextTime := next.Timestamp.In(ist)
+
+		if nextTime.Year() == dayStart.Year() &&
+			nextTime.Month() == dayStart.Month() &&
+			nextTime.Day() == dayStart.Day() {
+			next.Timestamp = timestamp
+			return next, true
+		}
+	}
+
+	return Candle{}, false
+}

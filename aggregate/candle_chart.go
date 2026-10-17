@@ -23,19 +23,12 @@ type CandleChart struct {
 }
 
 func NewCandleChart(id string, cfg map[string]any) (*CandleChart, error) {
-	
-	candleInterval, ok := cfg["candleInterval"].(string)
-	if !ok {
-		return nil, fmt.Errorf("CandleChart: candleInterval must be a string")
-	}
+
+	candleInterval := cfg["candleInterval"].(string)
 
 	duration, err := ParseInterval(candleInterval)
 	if err != nil {
 		return nil, fmt.Errorf("CandleChart: %w", err)
-	}
-
-	if duration < time.Minute || duration%time.Minute != 0 {
-		return nil, fmt.Errorf("CandleChart: candleInterval must be whole minutes")
 	}
 
 	return &CandleChart{
